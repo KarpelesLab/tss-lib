@@ -118,6 +118,30 @@ rs, err := eddsatss.NewResharing(ctx, resharingParams, oldKey)
 newKey := <-rs.Done
 ```
 
+### FROST (Ed25519)
+
+The `frosttss` package implements FROST (Flexible Round-Optimized Schnorr Threshold) over Ed25519 per [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html) §6.1. It is Schnorr-based, uses a Pedersen DKG (RFC 9591 Appendix D), and produces 64-byte signatures verifiable by any standard Ed25519 verifier.
+
+Compared to `eddsatss`, FROST signing is leaner (two rounds vs three) and uses the FROST binding-factor aggregation that prevents nonce-reuse attacks. Keys produced by `frosttss` are NOT interchangeable with `eddsatss` keys — the DKG, the per-party-state shape, and the aggregation logic all differ.
+
+```go
+import "github.com/KarpelesLab/tss-lib/v2/frosttss"
+
+// Keygen — Pedersen DKG; no pre-params required
+kg, err := frosttss.NewKeygen(ctx, params)
+key := <-kg.Done // key.GroupPublicKey is the Ed25519 public key
+
+// Signing — RFC 9591 two-round non-coordinator protocol
+sig, err := key.NewSigning(ctx, msg, params)
+result := <-sig.Done // result.Signature is a 64-byte Ed25519 signature
+
+// Re-sharing
+rs, err := frosttss.NewResharing(ctx, resharingParams, oldKey)
+newKey := <-rs.Done
+```
+
+FROST(Ristretto255) and a FROST-style threshold ECDSA path (Lindell-Tseng / GG24 hybrid with a separate aux-info round) are planned follow-up phases.
+
 ### Importing an existing key
 
 Both `ecdsatss` and `eddsatss` provide an `ImportKey` helper that wraps a plain,
