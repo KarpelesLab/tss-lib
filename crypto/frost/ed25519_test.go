@@ -50,18 +50,19 @@ func TestH2MatchesEd25519Challenge(t *testing.T) {
 }
 
 func TestLagrangeCoefficientUnit(t *testing.T) {
+	cs := Ed25519Ciphersuite()
 	// Trivial: with a single signer, lambda = 1.
 	id := big.NewInt(7)
-	lam := LagrangeCoefficient(id, []*big.Int{id})
+	lam := LagrangeCoefficient(cs, id, []*big.Int{id})
 	assert.Equal(t, big.NewInt(1), lam)
 
 	// Two signers (ids 3, 5): lambda_3 = 5/(5-3), lambda_5 = 3/(3-5)
 	modQ := common.ModInt(L)
-	lam3 := LagrangeCoefficient(big.NewInt(3), []*big.Int{big.NewInt(3), big.NewInt(5)})
+	lam3 := LagrangeCoefficient(cs, big.NewInt(3), []*big.Int{big.NewInt(3), big.NewInt(5)})
 	want3 := modQ.Mul(big.NewInt(5), modQ.ModInverse(big.NewInt(2)))
 	assert.Zero(t, lam3.Cmp(want3))
 
-	lam5 := LagrangeCoefficient(big.NewInt(5), []*big.Int{big.NewInt(3), big.NewInt(5)})
+	lam5 := LagrangeCoefficient(cs, big.NewInt(5), []*big.Int{big.NewInt(3), big.NewInt(5)})
 	want5 := modQ.Mul(big.NewInt(3), modQ.ModInverse(big.NewInt(-2)))
 	want5 = new(big.Int).Mod(want5, L)
 	assert.Zero(t, lam5.Cmp(want5))

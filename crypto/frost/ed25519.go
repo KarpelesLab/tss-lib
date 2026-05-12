@@ -7,15 +7,16 @@ import (
 
 	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/group"
 )
 
 // ContextString is the FROST(Ed25519, SHA-512) ciphersuite domain separator
-// per RFC 9591 §6.1.4. It is mixed into all FROST-specific hashes (H1, H3, H4,
-// H5) but deliberately NOT into H2 — H2 is the plain Ed25519 challenge hash so
-// FROST(Ed25519) signatures verify under any Ed25519 verifier.
+// per RFC 9591 §6.1.4. It is mixed into all FROST-specific hashes (H1, H3,
+// H4, H5) but deliberately NOT into H2 — H2 is the plain Ed25519 challenge
+// hash so FROST(Ed25519) signatures verify under any Ed25519 verifier.
 var ContextString = []byte("FROST-ED25519-SHA512-v1")
 
-// L is the Ed25519 group order (subgroup order):
+// L is the Ed25519 group order (same as Ristretto255 order):
 // 2^252 + 27742317777372353535851937790883648493.
 var L = func() *big.Int {
 	l, ok := new(big.Int).SetString("7237005577332262213973186563042994240857116359379907606001950938285454250989", 10)
@@ -24,6 +25,23 @@ var L = func() *big.Int {
 	}
 	return l
 }()
+
+// ed25519Ciphersuite implements Ciphersuite for FROST(Ed25519, SHA-512).
+type ed25519Ciphersuite struct{}
+
+var ed25519CSSingleton ed25519Ciphersuite
+
+// Ed25519Ciphersuite returns the singleton FROST(Ed25519, SHA-512) ciphersuite.
+func Ed25519Ciphersuite() Ciphersuite { return ed25519CSSingleton }
+
+func (ed25519Ciphersuite) Name() string          { return "ed25519" }
+func (ed25519Ciphersuite) Group() group.Group    { return group.Ed25519() }
+func (ed25519Ciphersuite) ContextString() []byte { return ContextString }
+func (ed25519Ciphersuite) H1(m []byte) *big.Int  { return H1(m) }
+func (ed25519Ciphersuite) H2(m []byte) *big.Int  { return H2(m) }
+func (ed25519Ciphersuite) H3(m []byte) *big.Int  { return H3(m) }
+func (ed25519Ciphersuite) H4(m []byte) []byte    { return H4(m) }
+func (ed25519Ciphersuite) H5(m []byte) []byte    { return H5(m) }
 
 // H1 maps an input to a scalar mod L using domain separator "rho".
 // Used to derive the per-signer binding factor rho_i (RFC 9591 §4.4).
@@ -42,16 +60,13 @@ func H2(m []byte) *big.Int {
 }
 
 // H3 maps an input to a scalar mod L using domain separator "nonce".
-// Used for deterministic nonce generation (RFC 9591 §4.1, currently unused as
-// nonces in this implementation are uniformly random — exposed for callers
-// that want the RFC's deterministic construction).
 func H3(m []byte) *big.Int {
 	return hashToScalar(ContextString, []byte("nonce"), m)
 }
 
 // H4 hashes a message under domain separator "msg" and returns the raw 64-byte
-// digest (not reduced). Per RFC 9591 §4.4, the digest is fed into H1 as part
-// of the binding-factor input.
+// digest. Per RFC 9591 §4.4, the digest is fed into H1 as part of the
+// binding-factor input.
 func H4(m []byte) []byte {
 	h := sha512.New()
 	h.Write(ContextString)
@@ -61,8 +76,7 @@ func H4(m []byte) []byte {
 }
 
 // H5 hashes the encoded commitment list under domain separator "com" and
-// returns the raw 64-byte digest. Per RFC 9591 §4.4, the digest is the second
-// input to H1 alongside H4(msg).
+// returns the raw 64-byte digest.
 func H5(m []byte) []byte {
 	h := sha512.New()
 	h.Write(ContextString)
@@ -71,10 +85,7 @@ func H5(m []byte) []byte {
 	return h.Sum(nil)
 }
 
-// hashToScalar computes SHA-512(prefix || sep || msg) and reduces it mod L.
-// The reduction is via ScReduce, the same routine Ed25519 uses internally, so
-// the resulting scalar is exactly the value an Ed25519 implementation would
-// see when interpreting a 64-byte tag.
+// hashToScalar computes SHA-512(parts...) and reduces mod L via ScReduce.
 func hashToScalar(parts ...[]byte) *big.Int {
 	h := sha512.New()
 	for _, p := range parts {
@@ -87,29 +98,17 @@ func hashToScalar(parts ...[]byte) *big.Int {
 	return scalarFromLE(reduced[:])
 }
 
-// EncodeScalar encodes a scalar as 32 bytes little-endian (Ed25519 wire format).
-// The scalar is reduced mod L before encoding so callers don't have to pre-reduce.
-func EncodeScalar(s *big.Int) []byte {
-	r := new(big.Int).Mod(s, L)
-	b := r.Bytes()
-	out := make([]byte, 32)
-	// big.Int.Bytes() is big-endian; reverse into little-endian and zero-pad on the right.
-	for i, v := range b {
-		out[len(b)-1-i] = v
-	}
-	return out
-}
+// EncodeScalar encodes a scalar as 32 bytes little-endian (Ed25519 wire
+// format). Equivalent to group.Ed25519().EncodeScalar; kept as a top-level
+// helper for backwards compatibility with the Phase-1 API.
+func EncodeScalar(s *big.Int) []byte { return group.Ed25519().EncodeScalar(s) }
 
 // DecodeScalar decodes a 32-byte little-endian Ed25519 scalar.
 func DecodeScalar(b []byte) (*big.Int, error) {
 	if len(b) != 32 {
 		return nil, errors.New("frost: scalar must be 32 bytes")
 	}
-	s := scalarFromLE(b)
-	if s.Cmp(L) >= 0 {
-		return nil, errors.New("frost: scalar exceeds group order L")
-	}
-	return s, nil
+	return group.Ed25519().DecodeScalar(b)
 }
 
 // scalarFromLE interprets b as a little-endian scalar without bounds checking.
@@ -122,93 +121,24 @@ func scalarFromLE(b []byte) *big.Int {
 }
 
 // EncodeElement encodes an Ed25519 group element as the canonical 32-byte
-// representation specified by RFC 8032 §5.1.2 (little-endian Y with the X
-// sign bit packed into the top bit of the last byte).
-//
-// The input must be on the Ed25519 curve. The output is suitable for use as a
-// signature's R component or for hashing into H2/H4/H5.
+// representation. Equivalent to group.AdaptECPoint(p).Bytes().
 func EncodeElement(p *crypto.ECPoint) []byte {
-	return ecPointToEdwardsCanonical(p.X(), p.Y())
+	return group.AdaptECPoint(p).Bytes()
 }
 
-// DecodeElement decodes a canonical 32-byte Ed25519 encoding into an ECPoint.
-// Returns an error if the encoding is not a valid point on the curve.
+// DecodeElement decodes a canonical 32-byte Ed25519 encoding into a
+// *crypto.ECPoint. Returns an error if the encoding is invalid. Includes
+// cofactor clearing per group.Ed25519().DecodeElement semantics.
 func DecodeElement(b []byte) (*crypto.ECPoint, error) {
-	if len(b) != 32 {
-		return nil, errors.New("frost: element must be 32 bytes")
+	el, err := group.Ed25519().DecodeElement(b)
+	if err != nil {
+		return nil, err
 	}
-	var enc [32]byte
-	copy(enc[:], b)
-	var ge edwards25519.ExtendedGroupElement
-	if !ge.FromBytes(&enc) {
-		return nil, errors.New("frost: invalid Ed25519 point encoding")
-	}
-	x, y := extendedToAffine(&ge)
-	return crypto.NewECPoint(edwards25519.Edwards(), x, y)
+	return group.ECPoint(el), nil
 }
 
-// EdwardsCurve returns the registered Ed25519 elliptic curve.
+// EdwardsCurve returns the registered Ed25519 elliptic curve. Kept for
+// backwards compatibility with Phase-1 callers.
 func EdwardsCurve() *edwards25519.TwistedEdwardsCurve {
 	return edwards25519.Edwards()
-}
-
-// --- private encoding helpers (mirror eddsatss/utils.go) ---
-
-func ecPointToEdwardsCanonical(x, y *big.Int) []byte {
-	yLE := bigIntToLE32(y)
-	xLE := bigIntToLE32(x)
-	var xFE edwards25519.FieldElement
-	edwards25519.FeFromBytes(&xFE, xLE)
-	negative := edwards25519.FeIsNegative(&xFE) == 1
-	out := make([]byte, 32)
-	copy(out, yLE[:])
-	if negative {
-		out[31] |= 1 << 7
-	} else {
-		out[31] &^= 1 << 7
-	}
-	return out
-}
-
-func bigIntToLE32(a *big.Int) *[32]byte {
-	out := new([32]byte)
-	if a == nil {
-		return out
-	}
-	be := a.Bytes()
-	// Right-pad to 32 bytes (big-endian), then reverse to little-endian.
-	if len(be) > 32 {
-		// truncate from the left (high-order bytes)
-		be = be[len(be)-32:]
-	}
-	pad := 32 - len(be)
-	for i, v := range be {
-		out[31-(i+pad)] = v
-	}
-	return out
-}
-
-func extendedToAffine(ge *edwards25519.ExtendedGroupElement) (*big.Int, *big.Int) {
-	var enc [32]byte
-	ge.ToBytes(&enc)
-	// The canonical encoding packs Y in the low 255 bits and X-sign in the top bit.
-	// We reconstruct big.Int X and Y by reading FieldElements from ge.
-	var x, y, zInv, recipX, recipY edwards25519.FieldElement
-	edwards25519.FeInvert(&zInv, &ge.Z)
-	edwards25519.FeMul(&recipX, &ge.X, &zInv)
-	edwards25519.FeMul(&recipY, &ge.Y, &zInv)
-	x = recipX
-	y = recipY
-	var xBytes, yBytes [32]byte
-	edwards25519.FeToBytes(&xBytes, &x)
-	edwards25519.FeToBytes(&yBytes, &y)
-	return le32ToBigInt(&xBytes), le32ToBigInt(&yBytes)
-}
-
-func le32ToBigInt(b *[32]byte) *big.Int {
-	be := make([]byte, 32)
-	for i := 0; i < 32; i++ {
-		be[31-i] = b[i]
-	}
-	return new(big.Int).SetBytes(be)
 }

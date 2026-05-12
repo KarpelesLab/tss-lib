@@ -15,8 +15,10 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/ipfs/go-log/v2 v2.1.3 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect

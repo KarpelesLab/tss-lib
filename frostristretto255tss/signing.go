@@ -1,46 +1,39 @@
-package frosttss
+package frostristretto255tss
 
 import (
 	"context"
 	"fmt"
 	"math/big"
 
-	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/group"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
-// Signing tracks a threshold FROST(Ed25519) signing operation. It implements
-// the two-round non-coordinator signing protocol from RFC 9591 §5.
+// Signing tracks a threshold FROST(ristretto255) signing operation per
+// RFC 9591 §5 (two-round non-coordinator).
 type Signing struct {
 	ctx    context.Context
 	params *tss.Parameters
 	key    *Key
 	msg    []byte
 
-	// preprocessing nonces (round 1)
-	di, ei *big.Int      // hiding and binding scalars
-	Di, Ei group.Element // d_i*G, e_i*G
+	di, ei *big.Int
+	Di, Ei group.Element
 
 	Done chan *SignatureData
 	Err  chan error
 }
 
-// NewSigning starts a FROST(Ed25519) signing session against the message msg.
+// NewSigning starts a FROST(ristretto255) signing session.
 //
-// The receiver key may have been produced by a keygen that involved more
-// parties than the current signing committee; NewSigning transparently
-// reindexes Ks and BigXj to match params.Parties().IDs() via SubsetForParties.
-//
-// The signing committee size must be at least threshold+1.
+// The key may have been produced by a keygen with more parties than the
+// current signing committee; the receiver-side Ks/BigXj are transparently
+// reindexed via SubsetForParties.
 func (key *Key) NewSigning(ctx context.Context, msg []byte, params *tss.Parameters) (*Signing, error) {
-	if !tss.SameCurve(params.EC(), frost.EdwardsCurve()) {
-		return nil, fmt.Errorf("frosttss: FROST(Ed25519) requires the Ed25519 curve")
-	}
 	if params.PartyCount() < params.Threshold()+1 {
-		return nil, fmt.Errorf("frosttss: signing committee size %d < threshold+1 (%d)",
+		return nil, fmt.Errorf("frostristretto255tss: signing committee size %d < threshold+1 (%d)",
 			params.PartyCount(), params.Threshold()+1)
 	}
 	subset, err := key.SubsetForParties(params.Parties().IDs())
@@ -61,12 +54,10 @@ func (key *Key) NewSigning(ctx context.Context, msg []byte, params *tss.Paramete
 	return s, nil
 }
 
-// round1 samples nonces (d_i, e_i), computes commitments (D_i, E_i), and
-// broadcasts them.
 func (s *Signing) round1() error {
 	Pi := s.params.PartyID()
 	i := Pi.Index
-	g := group.Ed25519()
+	g := group.Ristretto255()
 
 	s.di = g.RandomScalar(s.params.Rand())
 	s.ei = g.RandomScalar(s.params.Rand())
@@ -86,26 +77,23 @@ func (s *Signing) round1() error {
 		Binding: s.Ei.Bytes(),
 	}
 	for _, p := range otherIds {
-		m := tss.JsonWrap("frost:ed25519:sign:round1", r1, Pi, p)
+		m := tss.JsonWrap("frost:ristretto255:sign:round1", r1, Pi, p)
 		s.params.Broker().Receive(m)
 	}
 
-	rcv := tss.NewJsonExpect[signRound1msg]("frost:ed25519:sign:round1", otherIds, s.round2)
-	s.params.Broker().Connect("frost:ed25519:sign:round1", rcv)
+	rcv := tss.NewJsonExpect[signRound1msg]("frost:ristretto255:sign:round1", otherIds, s.round2)
+	s.params.Broker().Connect("frost:ristretto255:sign:round1", rcv)
 	return nil
 }
 
-// round2 assembles the full nonce-commitment list, derives binding factors,
-// computes the group commitment R and challenge c, computes the partial
-// signature z_i, and broadcasts it.
 func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	if s.ctx.Err() != nil {
 		s.Err <- s.ctx.Err()
 		return
 	}
 	Pi := s.params.PartyID()
-	g := group.Ed25519()
-	cs := frost.Ed25519Ciphersuite()
+	g := group.Ristretto255()
+	cs := frost.Ristretto255Ciphersuite()
 
 	commitments := make([]frost.NonceCommitment, 0, len(otherIds)+1)
 	commitments = append(commitments, frost.NonceCommitment{
@@ -137,8 +125,7 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 		s.Err <- fmt.Errorf("ComputeGroupCommitment: %w", err)
 		return
 	}
-	groupPubEl := group.AdaptECPoint(s.key.GroupPublicKey)
-	c := frost.ComputeGroupChallenge(cs, R, groupPubEl, s.msg)
+	c := frost.ComputeGroupChallenge(cs, R, s.key.GroupPublicKey, s.msg)
 
 	signerIDs := make([]*big.Int, 0, len(commitments))
 	for _, cm := range commitments {
@@ -146,7 +133,6 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	}
 	lambda_i := frost.LagrangeCoefficient(cs, Pi.KeyInt(), signerIDs)
 
-	// z_i = d_i + e_i * rho_i + lambda_i * s_i * c (mod L)
 	rho_i := bindingFactors[Pi.KeyInt().String()]
 	modQ := common.ModInt(g.Order())
 	term2 := modQ.Mul(s.ei, rho_i)
@@ -155,18 +141,16 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 
 	r2 := &signRound2msg{Z: g.EncodeScalar(zi)}
 	for _, p := range otherIds {
-		m := tss.JsonWrap("frost:ed25519:sign:round2", r2, Pi, p)
+		m := tss.JsonWrap("frost:ristretto255:sign:round2", r2, Pi, p)
 		s.params.Broker().Receive(m)
 	}
 
-	rcv := tss.NewJsonExpect[signRound2msg]("frost:ed25519:sign:round2", otherIds, func(ids []*tss.PartyID, msgs []*signRound2msg) {
+	rcv := tss.NewJsonExpect[signRound2msg]("frost:ristretto255:sign:round2", otherIds, func(ids []*tss.PartyID, msgs []*signRound2msg) {
 		s.finalize(commitments, bindingFactors, R, c, zi, ids, msgs)
 	})
-	s.params.Broker().Connect("frost:ed25519:sign:round2", rcv)
+	s.params.Broker().Connect("frost:ristretto255:sign:round2", rcv)
 }
 
-// finalize verifies each peer's partial signature, sums the partials, and
-// emits the final (R, S) signature.
 func (s *Signing) finalize(
 	commitments []frost.NonceCommitment,
 	bindingFactors map[string]*big.Int,
@@ -180,13 +164,13 @@ func (s *Signing) finalize(
 		s.Err <- s.ctx.Err()
 		return
 	}
-	g := group.Ed25519()
-	cs := frost.Ed25519Ciphersuite()
+	g := group.Ristretto255()
+	cs := frost.Ristretto255Ciphersuite()
 	modQ := common.ModInt(g.Order())
 
 	bigXByID := make(map[string]group.Element, len(s.key.BigXj))
 	for j, kj := range s.key.Ks {
-		bigXByID[kj.String()] = group.AdaptECPoint(s.key.BigXj[j])
+		bigXByID[kj.String()] = s.key.BigXj[j]
 	}
 	commitByID := make(map[string]frost.NonceCommitment, len(commitments))
 	for _, cm := range commitments {
@@ -241,15 +225,15 @@ func (s *Signing) finalize(
 	sig = append(sig, rEnc...)
 	sig = append(sig, sEnc...)
 
-	pk := &edwards25519.PublicKey{
-		Curve: s.params.EC(),
-		X:     s.key.GroupPublicKey.X(),
-		Y:     s.key.GroupPublicKey.Y(),
+	// Self-verify via Schnorr-style check: z*G ?= R + c*pubkey.
+	lhs := g.ScalarBaseMult(z)
+	rhs, err := R.Add(s.key.GroupPublicKey.ScalarMult(c))
+	if err != nil {
+		s.Err <- fmt.Errorf("self-verify: %w", err)
+		return
 	}
-	rBigInt := leBytesToBigInt(rEnc)
-	sBigInt := leBytesToBigInt(sEnc)
-	if !edwards25519.VerifyRS(pk, s.msg, rBigInt, sBigInt) {
-		s.Err <- fmt.Errorf("frosttss: aggregated signature failed local Ed25519 verification")
+	if !lhs.Equal(rhs) {
+		s.Err <- fmt.Errorf("frostristretto255tss: aggregated signature failed local Schnorr check")
 		return
 	}
 
@@ -261,10 +245,31 @@ func (s *Signing) finalize(
 	}
 }
 
-func leBytesToBigInt(le []byte) *big.Int {
-	be := make([]byte, len(le))
-	for i, v := range le {
-		be[len(le)-1-i] = v
+// VerifySignature reproduces the FROST(ristretto255) verification equation:
+//
+//	z * G == R + c * pubKey, where c = H2(R || pubKey || msg)
+//
+// It is exposed so callers can verify externally-received signatures without
+// needing to reconstruct the ciphersuite plumbing themselves.
+func VerifySignature(pubKey group.Element, msg, signature []byte) (bool, error) {
+	if len(signature) != 64 {
+		return false, fmt.Errorf("frostristretto255tss: signature must be 64 bytes, got %d", len(signature))
 	}
-	return new(big.Int).SetBytes(be)
+	g := group.Ristretto255()
+	cs := frost.Ristretto255Ciphersuite()
+	R, err := g.DecodeElement(signature[:32])
+	if err != nil {
+		return false, fmt.Errorf("decode R: %w", err)
+	}
+	z, err := g.DecodeScalar(signature[32:])
+	if err != nil {
+		return false, fmt.Errorf("decode S: %w", err)
+	}
+	c := frost.ComputeGroupChallenge(cs, R, pubKey, msg)
+	lhs := g.ScalarBaseMult(z)
+	rhs, err := R.Add(pubKey.ScalarMult(c))
+	if err != nil {
+		return false, err
+	}
+	return lhs.Equal(rhs), nil
 }

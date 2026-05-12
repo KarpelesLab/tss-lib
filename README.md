@@ -140,7 +140,28 @@ rs, err := frosttss.NewResharing(ctx, resharingParams, oldKey)
 newKey := <-rs.Done
 ```
 
-FROST(Ristretto255) and a FROST-style threshold ECDSA path (Lindell-Tseng / GG24 hybrid with a separate aux-info round) are planned follow-up phases.
+### FROST (Ristretto255)
+
+The `frostristretto255tss` package implements FROST(ristretto255, SHA-512) per [RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html) §6.2. The protocol shape is identical to `frosttss`, but signatures are 64 bytes in the natural Ristretto255 format (32-byte R || 32-byte S) and are **not** Ed25519-compatible — verifiers must be Ristretto-aware.
+
+```go
+import "github.com/KarpelesLab/tss-lib/v2/frostristretto255tss"
+
+// Keygen
+kg, err := frostristretto255tss.NewKeygen(ctx, params)
+key := <-kg.Done // key.GroupPublicKey is a *crypto/group.Element (Ristretto255)
+
+// Signing
+sig, err := key.NewSigning(ctx, msg, params)
+result := <-sig.Done
+
+// Verify externally
+ok, err := frostristretto255tss.VerifySignature(key.GroupPublicKey, msg, result.Signature)
+```
+
+Both FROST packages share `crypto/frost` (ciphersuite + binding) and `crypto/group` (the prime-order group abstraction shared by Ed25519 and Ristretto255). Construct `tss.Parameters` with `tss.Edwards()` as a placeholder curve when calling the Ristretto255 package — the Ed25519 elliptic curve is unused, but its scalar field matches Ristretto255's so the parameters are otherwise compatible.
+
+A FROST-style threshold ECDSA path (Lindell-Tseng / GG24 hybrid with a separate aux-info round) is planned as a follow-up phase.
 
 ### Importing an existing key
 
