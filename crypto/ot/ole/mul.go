@@ -129,6 +129,19 @@ func BobStep1(sid []byte, extSender *otext.ExtSender, beta *big.Int, aliceMsg *o
 //
 // After this call the underlying state is logically consumed; callers
 // should discard the AliceState.
+//
+// Constant-time on α: the per-bit "add correction or not" decision is
+// implemented as a byte-level conditional copy rather than an
+// if-branch, so the running time and access pattern do not depend on
+// the bits of α. α is the local party's secret scalar (k_i, σ_i, or
+// ρ_i depending on the layer), so a data-dependent branch here is a
+// usable side channel for a local attacker.
+//
+// The big.Int operations underneath are NOT inherently constant time
+// (math/big is documented as variable-time), but with a fixed
+// q-modulus and uniformly-bounded operands the per-iteration cost is
+// effectively flat. The branch removal closes the structurally-clear
+// leak.
 func AliceStep2(state *AliceState, bobMsg *BobMsg) (*big.Int, error) {
 	if state == nil {
 		return nil, errors.New("ole: AliceStep2 nil state")
@@ -141,18 +154,41 @@ func AliceStep2(state *AliceState, bobMsg *BobMsg) (*big.Int, error) {
 	}
 	q := tss.S256().Params().N
 
+	// Length up-front: at least one nil correction MUST surface as an
+	// error rather than a panic-on-add. We range over the slice once
+	// rather than checking only on the α=1 path because the latter is
+	// itself a side channel (presence of a nil triggers different
+	// timing than absence). With a fixed slice length the early check
+	// is α-independent.
+	for i, c := range bobMsg.Corrections {
+		if c == nil {
+			return nil, fmt.Errorf("ole: AliceStep2 nil correction[%d]", i)
+		}
+	}
+
+	// Precompute the q-byte width once; both candidates are normalised
+	// to this width for the conditional copy.
+	const qBytes = 32
 	uA := new(big.Int)
 	for i := 0; i < ScalarBits; i++ {
-		ki := new(big.Int).SetBytes(state.keys[i][:])
-		ki.Mod(ki, q)
-		// t_i = m_{α_i}[i] + α_i · c_i (mod q)
-		if state.alpha.Bit(i) == 1 {
-			if bobMsg.Corrections[i] == nil {
-				return nil, fmt.Errorf("ole: AliceStep2 nil correction[%d]", i)
-			}
-			ki.Add(ki, bobMsg.Corrections[i])
-			ki.Mod(ki, q)
+		base := new(big.Int).SetBytes(state.keys[i][:])
+		base.Mod(base, q)
+		corrected := new(big.Int).Add(base, bobMsg.Corrections[i])
+		corrected.Mod(corrected, q)
+
+		// CT-select between base (α_i == 0) and corrected (α_i == 1)
+		// via a byte-level mask. Both buffers always come from a Mod-q
+		// reduction so they fit in qBytes; left-pad to fixed width.
+		var baseBuf, corrBuf [qBytes]byte
+		base.FillBytes(baseBuf[:])
+		corrected.FillBytes(corrBuf[:])
+
+		mask := byte(-(state.alpha.Bit(i) & 1)) // 0x00 if bit==0, 0xFF if bit==1
+		var pick [qBytes]byte
+		for b := 0; b < qBytes; b++ {
+			pick[b] = baseBuf[b] ^ (mask & (baseBuf[b] ^ corrBuf[b]))
 		}
+		ki := new(big.Int).SetBytes(pick[:])
 		uA.Add(uA, ki)
 	}
 	uA.Mod(uA, q)

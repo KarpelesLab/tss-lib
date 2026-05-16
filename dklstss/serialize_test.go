@@ -108,32 +108,27 @@ func TestKeySaveLoadAllPartiesTogether(t *testing.T) {
 	assert.True(t, ecdsa.Verify(pub, msg[:], sig.R, sig.S))
 }
 
-// TestKeySaveLoadIdentityMaterial verifies the v2 wire format preserves
-// the Ed25519 long-term identity keys across a Save/Load round-trip and
-// that transcript signing still works against the reloaded key.
-func TestKeySaveLoadIdentityMaterial(t *testing.T) {
-	const n, th = 2, 1
-	priv, pub, err := GenerateIdentityKeys(n, rand.Reader)
-	require.NoError(t, err)
-
-	keys, err := KeygenWithIdentities(n, th, genPartyIDs(n), priv, pub, rand.Reader)
+// TestKeyLoadAcceptsLegacyV2Format verifies the post-M-1 wire-format
+// migration: v2 payloads containing identity-key fields (the now-removed
+// Ed25519 transcript-signing material) still load successfully, with
+// the identity material silently discarded. Backward compatibility
+// matters here because callers with existing v2 keys on disk must be
+// able to upgrade without re-running keygen.
+func TestKeyLoadAcceptsLegacyV2Format(t *testing.T) {
+	// Build a minimal v2 payload by saving a current-version key and
+	// rewriting its version tag back to 2 plus injecting the legacy
+	// identity_pub field. The loader must accept it and produce a
+	// working Key.
+	keys, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
 	require.NoError(t, err)
 
 	var buf bytes.Buffer
 	require.NoError(t, keys[0].Save(&buf))
-	loaded, err := Load(&buf)
-	require.NoError(t, err)
+	current := fmt.Sprintf("\"version\":%d", KeyWireVersion)
+	v2like := bytes.Replace(buf.Bytes(), []byte(current), []byte("\"version\":2,\"identity_pub\":\"AAA=\""), 1)
 
-	assert.Equal(t, []byte(keys[0].IdentityPub), []byte(loaded.IdentityPub), "IdentityPub must round-trip")
-	assert.Equal(t, []byte(keys[0].IdentityPriv), []byte(loaded.IdentityPriv), "IdentityPriv must round-trip")
-	require.Equal(t, n, len(loaded.PeerIdentityPubs), "PeerIdentityPubs length must round-trip")
-	for i := range loaded.PeerIdentityPubs {
-		assert.Equal(t, []byte(keys[0].PeerIdentityPubs[i]), []byte(loaded.PeerIdentityPubs[i]),
-			"PeerIdentityPubs[%d] must round-trip", i)
-	}
-
-	transcript := []byte("round 1 reveal")
-	sig := loaded.SignTranscript(transcript)
-	require.NotNil(t, sig, "loaded key must still sign transcripts")
-	assert.True(t, loaded.VerifyTranscript(0, transcript, sig), "loaded key's transcript signature must verify under own peer pub")
+	loaded, err := Load(bytes.NewReader(v2like))
+	require.NoError(t, err, "legacy v2 payload (with identity fields) must still load")
+	assert.Equal(t, keys[0].N, loaded.N)
+	assert.Equal(t, keys[0].Xi.String(), loaded.Xi.String())
 }

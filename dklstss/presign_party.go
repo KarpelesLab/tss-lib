@@ -326,10 +326,11 @@ func (pp *PresignParty) finalize(otherIds []*tss.PartyID, msgs []*signR3) {
 	// via round-4 reveal (handled by an "online" sign party that runs
 	// against this presign).
 	//
-	// For a fully-aggregated PresignOutput suitable for the
-	// synchronous SignWithPresign API, we'd need a single struct
-	// holding ALL parties' state. The broker-driven variant is by
-	// design per-party.
+	// aggregated is intentionally left false here — this output is NOT
+	// directly consumable by SignWithPresign / SignWithPresignDurable;
+	// both refuse to accept it. An online-sign protocol must compose
+	// per-party shares from every signer to produce a verifying
+	// signature.
 	out := &PresignOutput{
 		Pub:       pp.key.ECDSAPub,
 		R:         pp.R,
@@ -343,6 +344,7 @@ func (pp *PresignParty) finalize(otherIds []*tss.PartyID, msgs []*signR3) {
 				kRhoShare: new(big.Int).Set(pp.kRhoShare[pp.myPos]),
 			},
 		},
+		aggregated: false,
 	}
 	pp.Done <- out
 }

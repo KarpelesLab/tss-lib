@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -43,6 +44,17 @@ type KeygenParty struct {
 
 	baseRcv map[string]*baseot.Receiver // peerKey → base-OT Receiver state for direction "i = OT-Ext-Sender"
 	myDelta map[string][]byte           // peerKey → Δ used for above
+
+	// Round-1 join state. The VSS commitments arrive as a broadcast
+	// (one per dealer, identical bytes to every recipient) and the
+	// share + OT-base-sender material arrives as a unicast (different
+	// per recipient). round2 cannot run until BOTH halves are complete;
+	// r1JoinCount goes 0 → 1 → 2 and the goroutine that increments to 2
+	// drives the transition.
+	r1JoinCount atomic.Int32
+	r1Bcasts    []*keygenR1Bcast
+	r1Unicasts  []*keygenR1Unicast
+	r1OtherIds  []*tss.PartyID
 
 	Done chan *Key
 	Err  chan error
@@ -103,8 +115,27 @@ func (kg *KeygenParty) round1() error {
 	kg.shares = shares
 
 	encCommit := flattenPointXY(vs)
-
 	otherIds := otherPartyIDs(kg.params)
+	kg.r1OtherIds = otherIds
+
+	// BROADCAST: VSS commitments — identical to every recipient.
+	// Sending these as a To==nil broadcast (rather than N-1 separate
+	// unicasts with the same content) is the equivocation defense for
+	// H-3: a malicious dealer who unicasts different commitments to
+	// different peers in the pre-fix protocol can split the new
+	// committee onto divergent BigXj / ECDSAPub. With a broadcast, the
+	// broker contract is that every peer receives identical bytes; a
+	// production transport implementing tss.MessageBroker MUST honour
+	// this contract (or implement a reliable-broadcast / echo layer
+	// on top, which the test broker emulates by reference-sharing the
+	// same *JsonMessage to every recipient).
+	bcast := &keygenR1Bcast{VSSCommitments: encCommit}
+	bm := tss.JsonWrap(keygenTypeR1Bcast, bcast, Pi, nil)
+	if err := kg.params.Broker().Receive(bm); err != nil {
+		return fmt.Errorf("broker.Receive r1-bcast: %w", err)
+	}
+
+	// UNICAST: per-peer share + base-OT-Sender material (peer-specific).
 	for _, Pj := range otherIds {
 		shareForJ, err := findShareValue(kg.shares, Pj.KeyInt())
 		if err != nil {
@@ -119,27 +150,47 @@ func (kg *KeygenParty) round1() error {
 		}
 		kg.baseSnd[peerKeyStr(Pj)] = snd
 
-		r1 := &keygenR1{
-			VSSCommitments: encCommit,
-			Share:          shareForJ.Bytes(),
-			OTSenderSX:     sndMsg.S.X().Bytes(),
-			OTSenderSY:     sndMsg.S.Y().Bytes(),
-			OTSenderPokAX:  sndMsg.PoK.Alpha.X().Bytes(),
-			OTSenderPokAY:  sndMsg.PoK.Alpha.Y().Bytes(),
-			OTSenderPokT:   sndMsg.PoK.T.Bytes(),
+		uc := &keygenR1Unicast{
+			Share:         shareForJ.Bytes(),
+			OTSenderSX:    sndMsg.S.X().Bytes(),
+			OTSenderSY:    sndMsg.S.Y().Bytes(),
+			OTSenderPokAX: sndMsg.PoK.Alpha.X().Bytes(),
+			OTSenderPokAY: sndMsg.PoK.Alpha.Y().Bytes(),
+			OTSenderPokT:  sndMsg.PoK.T.Bytes(),
 		}
-		m := tss.JsonWrap(keygenTypeR1, r1, Pi, Pj)
+		m := tss.JsonWrap(keygenTypeR1Unicast, uc, Pi, Pj)
 		if err := kg.params.Broker().Receive(m); err != nil {
-			return fmt.Errorf("broker.Receive r1→%s: %w", Pj, err)
+			return fmt.Errorf("broker.Receive r1-uc→%s: %w", Pj, err)
 		}
 	}
 
-	rcv := tss.NewJsonExpect[keygenR1](keygenTypeR1, otherIds, kg.round2)
-	kg.params.Broker().Connect(keygenTypeR1, rcv)
+	rcvBcast := tss.NewJsonExpect[keygenR1Bcast](keygenTypeR1Bcast, otherIds, kg.onR1Bcast)
+	rcvUnicast := tss.NewJsonExpect[keygenR1Unicast](keygenTypeR1Unicast, otherIds, kg.onR1Unicast)
+	kg.params.Broker().Connect(keygenTypeR1Bcast, rcvBcast)
+	kg.params.Broker().Connect(keygenTypeR1Unicast, rcvUnicast)
 	return nil
 }
 
-func (kg *KeygenParty) round2(otherIds []*tss.PartyID, msgs []*keygenR1) {
+// onR1Bcast collects the broadcast half of round 1 (VSS commitments).
+// It and onR1Unicast race for the second-to-complete spot; the winner
+// fires round2.
+func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast) {
+	kg.r1Bcasts = msgs
+	if kg.r1JoinCount.Add(1) == 2 {
+		kg.round2(otherIds)
+	}
+}
+
+// onR1Unicast collects the unicast half of round 1 (per-peer share +
+// OT-base-sender). See onR1Bcast for the join semantics.
+func (kg *KeygenParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*keygenR1Unicast) {
+	kg.r1Unicasts = msgs
+	if kg.r1JoinCount.Add(1) == 2 {
+		kg.round2(otherIds)
+	}
+}
+
+func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 	if err := kg.ctx.Err(); err != nil {
 		kg.Err <- err
 		return
@@ -147,22 +198,25 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID, msgs []*keygenR1) {
 	Pi := kg.params.PartyID()
 	ec := kg.params.EC()
 	threshold := kg.params.Threshold()
+	bcasts := kg.r1Bcasts
+	ucs := kg.r1Unicasts
 
 	for n, pid := range otherIds {
-		r1 := msgs[n]
+		bc := bcasts[n]
+		uc := ucs[n]
 
-		if len(r1.VSSCommitments) != 2*(threshold+1) {
+		if len(bc.VSSCommitments) != 2*(threshold+1) {
 			kg.Err <- fmt.Errorf("party %s sent %d VSS-commitment coords, expected %d",
-				pid, len(r1.VSSCommitments), 2*(threshold+1))
+				pid, len(bc.VSSCommitments), 2*(threshold+1))
 			return
 		}
-		vsj, err := unflattenPointXY(ec, r1.VSSCommitments)
+		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
 			kg.Err <- fmt.Errorf("party %s VSS commitments decode: %w", pid, err)
 			return
 		}
 
-		shareInt := new(big.Int).SetBytes(r1.Share)
+		shareInt := new(big.Int).SetBytes(uc.Share)
 		sh := &vss.Share{Threshold: threshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, threshold, vsj) {
 			kg.Err <- fmt.Errorf("party %s VSS share verification failed", pid)
@@ -170,20 +224,20 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID, msgs []*keygenR1) {
 		}
 
 		Sj, err := crypto.NewECPoint(ec,
-			new(big.Int).SetBytes(r1.OTSenderSX),
-			new(big.Int).SetBytes(r1.OTSenderSY))
+			new(big.Int).SetBytes(uc.OTSenderSX),
+			new(big.Int).SetBytes(uc.OTSenderSY))
 		if err != nil {
 			kg.Err <- fmt.Errorf("party %s OT Sender S invalid: %w", pid, err)
 			return
 		}
 		alpha, err := crypto.NewECPoint(ec,
-			new(big.Int).SetBytes(r1.OTSenderPokAX),
-			new(big.Int).SetBytes(r1.OTSenderPokAY))
+			new(big.Int).SetBytes(uc.OTSenderPokAX),
+			new(big.Int).SetBytes(uc.OTSenderPokAY))
 		if err != nil {
 			kg.Err <- fmt.Errorf("party %s OT Sender PoK alpha invalid: %w", pid, err)
 			return
 		}
-		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(r1.OTSenderPokT)}
+		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(uc.OTSenderPokT)}
 		// Peer's Sj corresponds to direction "i is ExtSender" — sid
 		// names i as the OT-Ext-Sender.
 		sid := pairBaseSid(kg.ssid, pid.KeyInt(), Pi.KeyInt(), Pi.KeyInt())
@@ -333,14 +387,27 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 
 // --- wire types ----------------------------------------------------
 
-type keygenR1 struct {
+// keygenR1Bcast is the round-1 BROADCAST: VSS commitments only. These
+// are identical for every recipient, so they belong on a broadcast
+// channel — sending them N-1 times as unicasts (the pre-fix protocol)
+// gave a malicious dealer the option to equivocate by shipping
+// different commitments to different peers. With a broadcast plus the
+// broker contract that To==nil messages deliver identical bytes to
+// every peer, equivocation is closed off at the wire level.
+type keygenR1Bcast struct {
 	VSSCommitments [][]byte `json:"vss_commitments"`
-	Share          []byte   `json:"share"`
-	OTSenderSX     []byte   `json:"ot_sender_s_x"`
-	OTSenderSY     []byte   `json:"ot_sender_s_y"`
-	OTSenderPokAX  []byte   `json:"ot_sender_pok_alpha_x"`
-	OTSenderPokAY  []byte   `json:"ot_sender_pok_alpha_y"`
-	OTSenderPokT   []byte   `json:"ot_sender_pok_t"`
+}
+
+// keygenR1Unicast is the round-1 UNICAST half: the per-recipient Shamir
+// share plus this dealer's base-OT-Sender first-round message. Both
+// are inherently peer-specific.
+type keygenR1Unicast struct {
+	Share         []byte `json:"share"`
+	OTSenderSX    []byte `json:"ot_sender_s_x"`
+	OTSenderSY    []byte `json:"ot_sender_s_y"`
+	OTSenderPokAX []byte `json:"ot_sender_pok_alpha_x"`
+	OTSenderPokAY []byte `json:"ot_sender_pok_alpha_y"`
+	OTSenderPokT  []byte `json:"ot_sender_pok_t"`
 }
 
 type keygenR2 struct {
@@ -348,8 +415,9 @@ type keygenR2 struct {
 }
 
 const (
-	keygenTypeR1 = "dkls:keygen:r1"
-	keygenTypeR2 = "dkls:keygen:r2"
+	keygenTypeR1Bcast   = "dkls:keygen:r1bc"
+	keygenTypeR1Unicast = "dkls:keygen:r1uc"
+	keygenTypeR2        = "dkls:keygen:r2"
 )
 
 // --- helpers --------------------------------------------------------

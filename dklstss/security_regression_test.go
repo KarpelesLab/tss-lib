@@ -2,14 +2,19 @@ package dklstss
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/KarpelesLab/tss-lib/v2/crypto"
+	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
 // TestMakeSidNoTruncationAcross256Boundary verifies the audit fix that
@@ -93,4 +98,259 @@ func TestReshareRejectsZeroScaledShare(t *testing.T) {
 	require.Error(t, err, "Reshare with Xi=0 must error rather than silently substituting")
 	assert.Contains(t, err.Error(), "λ·x_i ≡ 0",
 		"error must clearly identify the corrupted share rather than a misleading downstream pubkey mismatch")
+}
+
+// TestValidateBasicRejectsXiBigXjMismatch covers the M-3 audit fix:
+// ValidateBasic now rejects a Key whose Xi · G doesn't equal
+// BigXj[Idx]. The pre-fix loader accepted such mismatches (the algebra
+// check was missing), and downstream signing produced a non-verifying
+// signature with no surface clue that the share was tampered.
+func TestValidateBasicRejectsXiBigXjMismatch(t *testing.T) {
+	keys, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
+	require.NoError(t, err)
+	require.NoError(t, keys[0].ValidateBasic())
+
+	// Flip Xi without updating BigXj[Idx] — the algebraic binding
+	// breaks and ValidateBasic must catch it.
+	bad := *keys[0]
+	bad.Xi = new(big.Int).Add(keys[0].Xi, big.NewInt(1))
+	bad.Xi.Mod(bad.Xi, tss.S256().Params().N)
+	err = bad.ValidateBasic()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "share / public-commitment binding")
+}
+
+// TestLoadRejectsXiBigXjMismatch covers the M-3 audit fix at the
+// serialization boundary: a tampered keyfile whose Xi has been bumped
+// without re-running keygen must be rejected at Load.
+func TestLoadRejectsXiBigXjMismatch(t *testing.T) {
+	keys, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, keys[0].Save(&buf))
+
+	// Tamper with the on-disk xi value. The Xi field is a *big.Int
+	// serialized as a raw JSON number (no quotes).
+	original := keys[0].Xi.String()
+	tampered := new(big.Int).Add(keys[0].Xi, big.NewInt(1))
+	tampered.Mod(tampered, tss.S256().Params().N)
+	rewritten := bytes.Replace(buf.Bytes(),
+		[]byte("\"xi\":"+original),
+		[]byte("\"xi\":"+tampered.String()),
+		1)
+	require.False(t, bytes.Equal(buf.Bytes(), rewritten), "xi rewrite must have changed the bytes")
+
+	_, err = Load(bytes.NewReader(rewritten))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "share / public-commitment binding")
+}
+
+// TestNewResharingRequiresOldECDSAPub covers the C-1 audit fix:
+// NewResharing must refuse to start without a valid oldECDSAPub. The
+// previous API took only oldKey, leaving NEW-only parties with no local
+// way to bind the resharing to a specific public key and letting a
+// single malicious OLD participant rotate the joint key silently.
+func TestNewResharingRequiresOldECDSAPub(t *testing.T) {
+	oldKeys, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
+	require.NoError(t, err)
+	newPIDs := genPartyIDsOffset(2, 9000)
+	combined := append(tss.UnSortedPartyIDs(nil), oldKeys[0].PartyIDs...)
+	combined = append(combined, newPIDs...)
+	combinedSorted := tss.SortPartyIDs(combined)
+	combinedCtx := tss.NewPeerContext(combinedSorted)
+
+	params := tss.NewParameters(tss.S256(), combinedCtx, oldKeys[0].PartyIDs[0], len(combinedSorted), 1)
+	params.SetBroker(tss.NewTestBroker())
+
+	_, err = NewResharing(context.Background(), params, nil, oldKeys[0], oldKeys[0].PartyIDs, newPIDs, 1)
+	require.Error(t, err, "nil oldECDSAPub must be rejected")
+	assert.Contains(t, err.Error(), "oldECDSAPub")
+}
+
+// TestNewResharingRejectsMismatchedOldECDSAPub covers the C-1 audit fix
+// from the OLD-side: an OLD participant whose oldKey.ECDSAPub disagrees
+// with the advertised oldECDSAPub must refuse to start. Otherwise a
+// caller could trick an OLD party into participating in a resharing
+// bound to a different key than the one they actually hold.
+func TestNewResharingRejectsMismatchedOldECDSAPub(t *testing.T) {
+	keysA, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
+	require.NoError(t, err)
+	keysB, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
+	require.NoError(t, err)
+	require.False(t, keysA[0].ECDSAPub.Equals(keysB[0].ECDSAPub))
+
+	newPIDs := genPartyIDsOffset(2, 9100)
+	combined := append(tss.UnSortedPartyIDs(nil), keysA[0].PartyIDs...)
+	combined = append(combined, newPIDs...)
+	combinedSorted := tss.SortPartyIDs(combined)
+	combinedCtx := tss.NewPeerContext(combinedSorted)
+
+	params := tss.NewParameters(tss.S256(), combinedCtx, keysA[0].PartyIDs[0], len(combinedSorted), 1)
+	params.SetBroker(tss.NewTestBroker())
+
+	_, err = NewResharing(context.Background(), params, keysB[0].ECDSAPub, keysA[0], keysA[0].PartyIDs, newPIDs, 1)
+	require.Error(t, err, "mismatched oldECDSAPub vs oldKey.ECDSAPub must be rejected")
+	assert.Contains(t, err.Error(), "does not match")
+}
+
+// TestResharingPartyDetectsMalformedOldContribution covers the C-1
+// audit fix end-to-end: when an OLD participant ships VSS shares whose
+// constant term doesn't sum to the advertised oldECDSAPub, the NEW
+// committee must abort rather than silently accept a rotated key.
+//
+// The attack model: tamper one OLD party's Xi between keygen and
+// resharing. The party will scale a wrong secret, so Σ V_old_i[0]
+// reconstructs to (oldPub + (Δλ_M · Δ) · G), which differs from the
+// advertised oldECDSAPub. finalize must catch this.
+func TestResharingPartyDetectsMalformedOldContribution(t *testing.T) {
+	const oldN, oldT = 2, 1
+	oldPIDs := tss.GenerateTestPartyIDs(oldN)
+	oldKeys := runDistributedKeygen(t, oldPIDs, oldT)
+	oldPub := oldKeys[0].ECDSAPub
+
+	// Tamper party 0's Xi so its scaled share contributes a different
+	// constant term to the new committee. We also adjust BigXj[Idx] to
+	// match (so ValidateBasic still passes on the tampered Key — M-3's
+	// cross-check catches a NAIVE tamper at constructor time; the C-1
+	// finalize check is what catches this CONSISTENT tamper at the
+	// protocol level). The pre-fix code would build a new Key under
+	// the rotated pub silently; the post-fix code must abort.
+	q := tss.S256().Params().N
+	tampered := *oldKeys[0]
+	tampered.Xi = new(big.Int).Add(oldKeys[0].Xi, big.NewInt(1))
+	tampered.Xi.Mod(tampered.Xi, q)
+	tampered.BigXj = append([]*crypto.ECPoint(nil), oldKeys[0].BigXj...)
+	tampered.BigXj[tampered.Idx] = crypto.ScalarBaseMult(tss.S256(), tampered.Xi)
+	require.NoError(t, tampered.ValidateBasic(), "tampered key should still pass ValidateBasic (Xi and BigXj[Idx] both flipped)")
+	oldKeys[0] = &tampered
+
+	newPIDs := genPartyIDsOffset(2, 9200)
+	const newT = 1
+	combined := append(tss.UnSortedPartyIDs(nil), oldPIDs...)
+	combined = append(combined, newPIDs...)
+	combinedSorted := tss.SortPartyIDs(combined)
+	combinedCtx := tss.NewPeerContext(combinedSorted)
+	oldSubset := tss.SortedPartyIDs{oldPIDs[0], oldPIDs[1]}
+
+	hub := newTestHub(len(combinedSorted))
+	pidIdx := map[string]int{}
+	for i, p := range combinedSorted {
+		pidIdx[p.KeyInt().String()] = i
+	}
+
+	for _, p := range oldSubset {
+		oldIdx := -1
+		for i, q := range oldPIDs {
+			if q.KeyInt().Cmp(p.KeyInt()) == 0 {
+				oldIdx = i
+				break
+			}
+		}
+		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), oldT)
+		params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
+		_, err := NewResharing(context.Background(), params, oldPub, oldKeys[oldIdx], oldSubset, newPIDs, newT)
+		require.NoError(t, err)
+	}
+
+	// Spawn NEW parties; at least one of them must surface the
+	// inconsistency on its Err channel.
+	var newParties []*ResharingParty
+	for _, p := range newPIDs {
+		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), newT)
+		params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
+		rp, err := NewResharing(context.Background(), params, oldPub, nil, oldSubset, newPIDs, newT)
+		require.NoError(t, err)
+		newParties = append(newParties, rp)
+	}
+
+	sawAbort := false
+	for i, rp := range newParties {
+		select {
+		case k := <-rp.Done:
+			t.Fatalf("party %d completed with key %v despite tampered OLD contribution", i, k)
+		case err := <-rp.Err:
+			require.Error(t, err)
+			if assert.Contains(t, err.Error(), "reconstructed public key") {
+				sawAbort = true
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatalf("party %d neither completed nor aborted", i)
+		}
+	}
+	require.True(t, sawAbort, "at least one new party must abort with the pubkey-mismatch error")
+}
+
+// TestSignWithPresignRejectsUnaggregatedOutput covers the H-1 audit fix:
+// the PresignOutput returned by the broker-driven PresignParty holds
+// only the local party's share. Feeding it into SignWithPresign in the
+// pre-fix code computed φ over a single signer's share and emitted a
+// non-verifying signature with no warning. The new check refuses such
+// inputs explicitly so the misuse cannot land in production silently.
+func TestSignWithPresignRejectsUnaggregatedOutput(t *testing.T) {
+	const partyCount, threshold = 2, 1
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	keys := runDistributedKeygen(t, pIDs, threshold)
+	outs := runDistributedPresign(t, keys, pIDs, []int{0, 1})
+	require.NotEmpty(t, outs)
+
+	msg := sha256.Sum256([]byte("unaggregated should fail"))
+	_, err := SignWithPresign(outs[0], msg[:], nil)
+	require.Error(t, err, "per-party PresignOutput must not silently produce a signature")
+	assert.Contains(t, err.Error(), "aggregated")
+
+	// The CAS must NOT have flipped — the per-party share is still
+	// available to a future online-sign protocol.
+	assert.False(t, outs[0].Consumed(), "rejected call must not mark the per-party share consumed")
+}
+
+// TestSignWithPresignDurableRejectsUnaggregatedOutput is the durable
+// variant of the above; the unaggregated check must fire BEFORE the
+// store records the R-hash so a misuse doesn't permanently burn a
+// presign record on a presign that cannot actually sign.
+func TestSignWithPresignDurableRejectsUnaggregatedOutput(t *testing.T) {
+	const partyCount, threshold = 2, 1
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	keys := runDistributedKeygen(t, pIDs, threshold)
+	outs := runDistributedPresign(t, keys, pIDs, []int{0, 1})
+	require.NotEmpty(t, outs)
+
+	store := NewInMemoryPresignStore()
+	msg := sha256.Sum256([]byte("unaggregated durable should fail"))
+	_, err := SignWithPresignDurable(outs[0], msg[:], nil, store)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "aggregated")
+
+	// Store must NOT have recorded the R-hash.
+	recorded, err := store.CheckAndRecord(outs[0].RHash())
+	require.NoError(t, err)
+	assert.True(t, recorded, "store must not have recorded the R-hash on the rejected call")
+}
+
+// TestKeygenPartyAllPartiesAgreeOnBigXj covers the H-3 audit fix:
+// after a distributed DKG, every party must hold the SAME BigXj table
+// (which is a function of every dealer's VSS commitments). Equivocation
+// — different commitments shipped to different recipients — would
+// produce divergent BigXj across parties. With the post-fix protocol
+// the VSS commitments travel via a To==nil broadcast whose contract
+// is identical-bytes-to-every-peer, so equivocation at the dealer
+// level is impossible in honest-broker deployments. The test broker
+// implements that contract by reference-sharing the same *JsonMessage.
+func TestKeygenPartyAllPartiesAgreeOnBigXj(t *testing.T) {
+	const partyCount, threshold = 4, 2
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	keys := runDistributedKeygen(t, pIDs, threshold)
+	require.Len(t, keys, partyCount)
+
+	ref := keys[0].BigXj
+	for i := 1; i < partyCount; i++ {
+		require.Equalf(t, len(ref), len(keys[i].BigXj), "party %d BigXj length mismatch", i)
+		for j := range ref {
+			assert.Truef(t, ref[j].Equals(keys[i].BigXj[j]),
+				"party %d BigXj[%d] differs from party 0 — equivocation defense regression?", i, j)
+		}
+		assert.Truef(t, ref[0].Curve() != nil, "party 0 BigXj[0] missing curve")
+		assert.Truef(t, keys[i].ECDSAPub.Equals(keys[0].ECDSAPub),
+			"party %d ECDSAPub differs from party 0", i)
+	}
 }

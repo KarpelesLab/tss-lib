@@ -51,44 +51,6 @@ func TestSignCheckedHDDeriveTweakApplied(t *testing.T) {
 	assert.True(t, ecdsa.Verify(pub, msg[:], sig.R, sig.S))
 }
 
-// TestIdentityKeyRoundTrip verifies SignTranscript/VerifyTranscript.
-func TestIdentityKeyRoundTrip(t *testing.T) {
-	priv, pub, err := GenerateIdentityKeys(3, rand.Reader)
-	require.NoError(t, err)
-	keys, err := KeygenWithIdentities(3, 1, genPartyIDs(3), priv, pub, rand.Reader)
-	require.NoError(t, err)
-
-	transcript := []byte("test transcript payload")
-	sig := keys[0].SignTranscript(transcript)
-	require.NotNil(t, sig)
-	require.NotEmpty(t, sig)
-
-	// All peers can verify party 0's transcript.
-	for i, peer := range keys {
-		assert.Truef(t, peer.VerifyTranscript(0, transcript, sig), "peer %d failed to verify party 0's transcript", i)
-	}
-
-	// Tampering with the transcript fails verification.
-	bad := append([]byte(nil), transcript...)
-	bad[0] ^= 1
-	assert.False(t, keys[1].VerifyTranscript(0, bad, sig))
-
-	// Wrong party index fails.
-	assert.False(t, keys[1].VerifyTranscript(2, transcript, sig))
-}
-
-// TestKeygenWithoutIdentitiesLeavesFieldsEmpty: plain Keygen does NOT
-// populate identity fields, which the synchronous tests don't need.
-func TestKeygenWithoutIdentitiesLeavesFieldsEmpty(t *testing.T) {
-	keys, err := Keygen(2, 1, genPartyIDs(2), rand.Reader)
-	require.NoError(t, err)
-	for i, k := range keys {
-		assert.Nilf(t, k.IdentityPriv, "key %d should have nil IdentityPriv", i)
-		assert.Nilf(t, k.IdentityPub, "key %d should have nil IdentityPub", i)
-		assert.Nil(t, k.SignTranscript([]byte("anything")), "no identity → SignTranscript returns nil")
-	}
-}
-
 // TestSignCheckedReportsCulpritOnByzantineBob is a placeholder: in the
 // synchronous in-process API there is no way for a peer to actually
 // "deviate" without us cheating in the test harness. The test below

@@ -58,17 +58,18 @@ func TestResharingPartyDisjointCommittees(t *testing.T) {
 		}
 		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), oldT)
 		params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
-		rp, err := NewResharing(context.Background(), params, oldKeys[oldIdx], oldSubset, newPIDs, newT)
+		rp, err := NewResharing(context.Background(), params, oldPub, oldKeys[oldIdx], oldSubset, newPIDs, newT)
 		require.NoError(t, err)
 		oldParties = append(oldParties, rp)
 	}
 
-	// Spawn NEW parties (all of newPIDs, no oldKey).
+	// Spawn NEW parties (all of newPIDs, no oldKey). oldPub is the
+	// out-of-band-shared public key being resharded.
 	var newParties []*ResharingParty
 	for _, p := range newPIDs {
 		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), newT)
 		params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
-		rp, err := NewResharing(context.Background(), params, nil, oldSubset, newPIDs, newT)
+		rp, err := NewResharing(context.Background(), params, oldPub, nil, oldSubset, newPIDs, newT)
 		require.NoError(t, err)
 		newParties = append(newParties, rp)
 	}

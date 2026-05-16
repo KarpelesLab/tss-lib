@@ -12,8 +12,17 @@
 //     the public key
 //   - HD wallet derivation (BIP32 non-hardened) at sign time
 //   - Malicious-secure signing (Mul-then-check) with identifiable abort
-//   - Long-term identity keys (Ed25519) for transcript signing
+//     for cryptographically-detectable deviations (Bob's β inconsistency
+//     across parallel ΠMul runs)
 //   - Versioned Key Save/Load for persistence
+//
+// Peer authentication is OUT OF SCOPE. The broker-driven Party state
+// machines trust whatever tss.MessageBroker implementation the caller
+// supplies to authenticate message origin. Pinning peer identities,
+// signing transport-level messages, and detecting equivocating peers
+// are the implementor's responsibility. Earlier revisions of this
+// package exposed Ed25519 identity-key helpers; those were removed
+// because the parties did not in fact bind them to round messages.
 //
 // Compared to the existing GG18-based ecdsatss/ package, dklstss/ has no
 // Paillier/MtA layer — the multiplicative-to-additive subprotocol is built
@@ -80,11 +89,13 @@
 //     for caller-provided durable nonce-commitment tracking across
 //     process restarts (SignWithPresignDurable). The library does not
 //     prescribe a storage backend — that is the caller's responsibility.
-//   - Identifiable abort relies on Ed25519 transcript signatures bound to
-//     long-term identity keys established at keygen
-//     (KeygenWithIdentities). Without identity keys, blame can still be
-//     assigned for cryptographic misbehavior caught by Mul-then-check,
-//     but not for transport-level equivocation.
+//   - Identifiable abort surfaces ONLY for cryptographically-detectable
+//     deviations: a malicious Bob who uses inconsistent β across the two
+//     parallel ΠMul runs is caught by SignChecked and the deviating
+//     PartyID is returned in the *tss.Error's Culprits(). Transport-level
+//     equivocation (a peer that sends different messages to different
+//     recipients) is the caller's problem — bind it at the
+//     tss.MessageBroker layer.
 //
 // References:
 //   - J. Doerner, Y. Kondi, E. Lee, A. Shelat. "Threshold ECDSA in Three

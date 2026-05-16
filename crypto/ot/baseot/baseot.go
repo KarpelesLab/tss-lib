@@ -1,6 +1,7 @@
 package baseot
 
 import (
+	"crypto/elliptic"
 	"errors"
 	"fmt"
 	"io"
@@ -118,26 +119,20 @@ func NewReceiver(sid []byte, n int, bits []byte, msg *SenderMsg1, rand io.Reader
 		x[i] = common.GetRandomPositiveInt(rand, q)
 		c := (bitsCopy[i/8] >> (uint(i) & 7)) & 1
 
-		// Always compute both candidates so the *which-branch-was-taken*
-		// timing channel does not leak c. The two ScalarBaseMult calls
-		// below operate on x[i] (non-secret with respect to the sender,
-		// since the sender can extract it offline from R given y) but
-		// the *selection* between Ra and Rb depends on the secret c;
-		// keep both computations live so timing doesn't betray c.
-		//
-		// TODO(ConstantTime): ScalarBaseMult is non-CT. The bigger issue is
-		// the if/else selection below — replace with a CT conditional copy
-		// once we have CT point ops.
-		Ra := crypto.ScalarBaseMult(ec, x[i])
+		// x[i] is the receiver's per-instance secret; route x[i]·G
+		// through the constant-time ladder so its bits don't leak via
+		// scalar-mult timing.
+		Ra := ctmul.ScalarBaseMult(ec, x[i])
 		Rb, err := Ra.Add(msg.S)
 		if err != nil {
 			return nil, nil, fmt.Errorf("baseot: NewReceiver Add: %w", err)
 		}
-		if c == 1 {
-			R[i] = Rb
-		} else {
-			R[i] = Ra
-		}
+		// CT-select between Ra (c=0) and Rb (c=1). c is a bit of Δ
+		// (the OT-Ext-Sender's long-term secret), so the selection
+		// branch must not depend on its value at the byte level. We
+		// XOR-blend the affine coordinates under a 0x00/0xFF mask;
+		// neither branch is skipped.
+		R[i] = ctSelectPoint(ec, c == 1, Ra, Rb)
 	}
 	_ = q
 
@@ -148,6 +143,40 @@ func NewReceiver(sid []byte, n int, bits []byte, msg *SenderMsg1, rand io.Reader
 		x:    x,
 		S:    msg.S,
 	}, &ReceiverMsg1{R: R}, nil
+}
+
+// ctSelectPoint returns b ? rb : ra in constant time at the
+// byte-encoding level. The two candidate points must both be on the
+// same curve (the caller arranges this — Ra, Rb = x·G, x·G + S share
+// the curve trivially).
+//
+// math/big's arithmetic is not itself constant time, so this defence
+// is "remove the data-dependent branch in the selection," not "make
+// every step independent of secret bits." It is the contract layer
+// the rest of the OT extension stack assumes.
+func ctSelectPoint(curve elliptic.Curve, b bool, ra, rb *crypto.ECPoint) *crypto.ECPoint {
+	var mask byte
+	if b {
+		mask = 0xFF
+	}
+	const coordBytes = 32 // secp256k1 field width
+	var xa, ya, xb, yb [coordBytes]byte
+	ra.X().FillBytes(xa[:])
+	ra.Y().FillBytes(ya[:])
+	rb.X().FillBytes(xb[:])
+	rb.Y().FillBytes(yb[:])
+
+	var xpick, ypick [coordBytes]byte
+	for i := 0; i < coordBytes; i++ {
+		xpick[i] = xa[i] ^ (mask & (xa[i] ^ xb[i]))
+		ypick[i] = ya[i] ^ (mask & (ya[i] ^ yb[i]))
+	}
+	// Both candidate points are on-curve, so the selected (x, y) is
+	// always one of them — skip the curve check to keep the helper
+	// data-independent in the fast path.
+	return crypto.NewECPointNoCurveCheck(curve,
+		new(big.Int).SetBytes(xpick[:]),
+		new(big.Int).SetBytes(ypick[:]))
 }
 
 // Finalize computes the sender's two output keys (k_{i,0}, k_{i,1}) for
@@ -202,8 +231,10 @@ func (r *Receiver) Finalize() ([][KeyLen]byte, error) {
 	keys := make([][KeyLen]byte, r.n)
 	for i := 0; i < r.n; i++ {
 		c := (r.bits[i/8] >> (uint(i) & 7)) & 1
-		// TODO(ConstantTime): non-CT scalar mult on secret x[i].
-		xS := r.S.ScalarMult(r.x[i])
+		// x[i] is the receiver's per-instance secret scalar; route
+		// x[i]·S through the constant-time ladder so the secret bits
+		// do not leak via scalar-mult timing.
+		xS := ctmul.ScalarMult(r.S, r.x[i])
 		keys[i] = deriveKey(r.sid, i, int(c), xS)
 	}
 	for i := range r.x {

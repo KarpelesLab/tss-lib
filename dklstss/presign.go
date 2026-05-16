@@ -44,8 +44,20 @@ type PresignOutput struct {
 	signerIdx []int
 	keys      []*Key
 
-	// Per-party offline state. Indexed in the order of signerIdx.
+	// Per-party offline state. When aggregated == true, parties holds
+	// the joint shares from ALL T+1 signers and the slice is consumable
+	// by SignWithPresign. When aggregated == false, parties holds only
+	// the local party's slice (one entry) — the broker-driven
+	// PresignParty produces this form and an online-sign protocol must
+	// compose shares from every signer to form a signature.
 	parties []*partyPresign
+
+	// aggregated distinguishes a fully-composed PresignOutput (sync
+	// Presign) from a per-party share (broker-driven PresignParty).
+	// SignWithPresign refuses to consume an unaggregated output —
+	// silently aggregating one party's shares would produce a
+	// non-verifying signature.
+	aggregated bool
 
 	consumed atomic.Bool
 }
@@ -210,12 +222,13 @@ func Presign(keys []*Key, signerIdx []int, rng io.Reader) (*PresignOutput, error
 	}
 
 	return &PresignOutput{
-		Pub:       pub,
-		R:         R,
-		r:         r,
-		signerIdx: append([]int(nil), signerIdx...),
-		keys:      keys,
-		parties:   parties,
+		Pub:        pub,
+		R:          R,
+		r:          r,
+		signerIdx:  append([]int(nil), signerIdx...),
+		keys:       keys,
+		parties:    parties,
+		aggregated: true,
 	}, nil
 }
 
@@ -277,6 +290,14 @@ func SignWithPresign(presign *PresignOutput, hash []byte, tweak *big.Int) (*Sign
 	}
 	if len(hash) == 0 {
 		return nil, errors.New("dklstss: SignWithPresign hash must be non-empty")
+	}
+	if !presign.aggregated {
+		// Per-party PresignOutput from broker-driven PresignParty;
+		// composing one signer's shares alone produces a non-verifying
+		// signature. Refuse explicitly rather than silently emit
+		// garbage. The CAS is NOT flipped on this path so the per-party
+		// share can still be fed into an online-sign protocol.
+		return nil, errors.New("dklstss: SignWithPresign requires an aggregated PresignOutput; the per-party output from PresignParty must be composed by an online sign protocol")
 	}
 	// Atomic CAS: only one caller can flip false → true; others get the
 	// already-consumed error.
@@ -360,6 +381,11 @@ func SignWithPresign(presign *PresignOutput, hash []byte, tweak *big.Int) (*Sign
 func SignWithPresignDurable(presign *PresignOutput, hash []byte, tweak *big.Int, store UsedPresignStore) (*Signature, error) {
 	if presign == nil {
 		return nil, errors.New("dklstss: SignWithPresignDurable nil presign")
+	}
+	if !presign.aggregated {
+		// Reject before touching the store so a misuse doesn't burn an
+		// R-hash record on a presign that can't actually sign.
+		return nil, errors.New("dklstss: SignWithPresignDurable requires an aggregated PresignOutput; the per-party output from PresignParty must be composed by an online sign protocol")
 	}
 	if store == nil {
 		return nil, errors.New("dklstss: SignWithPresignDurable nil store; use SignWithPresign for in-memory-only")

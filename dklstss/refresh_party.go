@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -49,6 +50,17 @@ type RefreshParty struct {
 	// peer round-1 inputs.
 	peerVs     map[string][]*crypto.ECPoint
 	peerShares map[string]*big.Int
+
+	// Round-1 join state. Like KeygenParty, the VSS commitments arrive
+	// as a broadcast and the share + OT-base-sender material arrives
+	// as a unicast; round2 cannot run until both halves are complete.
+	// The atomic counter goes 0 → 1 → 2 and the goroutine that reaches
+	// 2 drives the transition. See dklstss/keygen_party.go for the
+	// rationale (H-3 equivocation defense).
+	r1JoinCount atomic.Int32
+	r1Bcasts    []*refreshR1Bcast
+	r1Unicasts  []*refreshR1Unicast
+	r1OtherIds  []*tss.PartyID
 
 	Done chan *Key
 	Err  chan error
@@ -109,7 +121,18 @@ func (rp *RefreshParty) round1() error {
 
 	encVs := flattenPointXY(rp.vsSelf)
 	otherIds := otherPartyIDs(rp.params)
+	rp.r1OtherIds = otherIds
 
+	// BROADCAST: zero-constant-term Vs commitments (identical to every
+	// peer). H-3 equivocation defense — see keygen_party.go round1 for
+	// the broker-contract rationale.
+	bcast := &refreshR1Bcast{VSSCommitments: encVs}
+	bm := tss.JsonWrap(refreshTypeR1Bcast, bcast, Pi, nil)
+	if err := rp.params.Broker().Receive(bm); err != nil {
+		return fmt.Errorf("broker r1-bcast: %w", err)
+	}
+
+	// UNICAST: per-peer share + base-OT-Sender material.
 	for _, Pj := range otherIds {
 		shareForJ := rp.myShares[peerKeyStr(Pj)]
 		// Direction "j becomes ExtSender, i becomes ExtReceiver":
@@ -121,26 +144,42 @@ func (rp *RefreshParty) round1() error {
 		}
 		rp.baseSnd[peerKeyStr(Pj)] = snd
 
-		r1 := &refreshR1{
-			VSSCommitments: encVs,
-			Share:          shareForJ.Bytes(),
-			OTSenderSX:     sndMsg.S.X().Bytes(),
-			OTSenderSY:     sndMsg.S.Y().Bytes(),
-			OTSenderPokAX:  sndMsg.PoK.Alpha.X().Bytes(),
-			OTSenderPokAY:  sndMsg.PoK.Alpha.Y().Bytes(),
-			OTSenderPokT:   sndMsg.PoK.T.Bytes(),
+		uc := &refreshR1Unicast{
+			Share:         shareForJ.Bytes(),
+			OTSenderSX:    sndMsg.S.X().Bytes(),
+			OTSenderSY:    sndMsg.S.Y().Bytes(),
+			OTSenderPokAX: sndMsg.PoK.Alpha.X().Bytes(),
+			OTSenderPokAY: sndMsg.PoK.Alpha.Y().Bytes(),
+			OTSenderPokT:  sndMsg.PoK.T.Bytes(),
 		}
-		m := tss.JsonWrap(refreshTypeR1, r1, Pi, Pj)
+		m := tss.JsonWrap(refreshTypeR1Unicast, uc, Pi, Pj)
 		if err := rp.params.Broker().Receive(m); err != nil {
-			return fmt.Errorf("broker r1→%s: %w", Pj, err)
+			return fmt.Errorf("broker r1-uc→%s: %w", Pj, err)
 		}
 	}
-	rcv := tss.NewJsonExpect[refreshR1](refreshTypeR1, otherIds, rp.round2)
-	rp.params.Broker().Connect(refreshTypeR1, rcv)
+	rcvBcast := tss.NewJsonExpect[refreshR1Bcast](refreshTypeR1Bcast, otherIds, rp.onR1Bcast)
+	rcvUnicast := tss.NewJsonExpect[refreshR1Unicast](refreshTypeR1Unicast, otherIds, rp.onR1Unicast)
+	rp.params.Broker().Connect(refreshTypeR1Bcast, rcvBcast)
+	rp.params.Broker().Connect(refreshTypeR1Unicast, rcvUnicast)
 	return nil
 }
 
-func (rp *RefreshParty) round2(otherIds []*tss.PartyID, msgs []*refreshR1) {
+// onR1Bcast / onR1Unicast: see keygen_party.go for the join semantics.
+func (rp *RefreshParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*refreshR1Bcast) {
+	rp.r1Bcasts = msgs
+	if rp.r1JoinCount.Add(1) == 2 {
+		rp.round2(otherIds)
+	}
+}
+
+func (rp *RefreshParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*refreshR1Unicast) {
+	rp.r1Unicasts = msgs
+	if rp.r1JoinCount.Add(1) == 2 {
+		rp.round2(otherIds)
+	}
+}
+
+func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
 		rp.Err <- err
 		return
@@ -148,39 +187,42 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID, msgs []*refreshR1) {
 	Pi := rp.params.PartyID()
 	ec := rp.params.EC()
 	threshold := rp.old.T
+	bcasts := rp.r1Bcasts
+	ucs := rp.r1Unicasts
 
 	for n, pid := range otherIds {
-		r1 := msgs[n]
-		if len(r1.VSSCommitments) != 2*threshold {
+		bc := bcasts[n]
+		uc := ucs[n]
+		if len(bc.VSSCommitments) != 2*threshold {
 			rp.Err <- fmt.Errorf("party %s sent %d Vs coords, expected %d",
-				pid, len(r1.VSSCommitments), 2*threshold)
+				pid, len(bc.VSSCommitments), 2*threshold)
 			return
 		}
-		vsj, err := unflattenPointXY(ec, r1.VSSCommitments)
+		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
 			rp.Err <- fmt.Errorf("party %s Vs decode: %w", pid, err)
 			return
 		}
-		shareInt := new(big.Int).SetBytes(r1.Share)
+		shareInt := new(big.Int).SetBytes(uc.Share)
 		if !verifyZeroConstShare(vsj, Pi.KeyInt(), shareInt) {
 			rp.Err <- fmt.Errorf("party %s refresh-share verification failed", pid)
 			return
 		}
 		Sj, err := crypto.NewECPoint(ec,
-			new(big.Int).SetBytes(r1.OTSenderSX),
-			new(big.Int).SetBytes(r1.OTSenderSY))
+			new(big.Int).SetBytes(uc.OTSenderSX),
+			new(big.Int).SetBytes(uc.OTSenderSY))
 		if err != nil {
 			rp.Err <- fmt.Errorf("party %s OT-S invalid: %w", pid, err)
 			return
 		}
 		alpha, err := crypto.NewECPoint(ec,
-			new(big.Int).SetBytes(r1.OTSenderPokAX),
-			new(big.Int).SetBytes(r1.OTSenderPokAY))
+			new(big.Int).SetBytes(uc.OTSenderPokAX),
+			new(big.Int).SetBytes(uc.OTSenderPokAY))
 		if err != nil {
 			rp.Err <- fmt.Errorf("party %s OT-PoK-alpha invalid: %w", pid, err)
 			return
 		}
-		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(r1.OTSenderPokT)}
+		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(uc.OTSenderPokT)}
 		sid := pairBaseSid(rp.ssid, pid.KeyInt(), Pi.KeyInt(), Pi.KeyInt())
 		sndMsg := &baseot.SenderMsg1{S: Sj, PoK: pok}
 
@@ -367,22 +409,28 @@ func evalCommitmentSumZeroConst(vsSelf []*crypto.ECPoint, peerVs map[string][]*c
 	return out
 }
 
-// refreshR1 is the per-recipient round-1 message: VSS commitments to
-// the zero-constant polynomial, recipient's share, and base-OT-Sender
-// data.
-type refreshR1 struct {
+// refreshR1Bcast is the round-1 BROADCAST: Vs commitments to the
+// zero-constant polynomial. Same bytes for every peer; sent via a
+// To==nil broadcast as the H-3 equivocation defense.
+type refreshR1Bcast struct {
 	VSSCommitments [][]byte `json:"vss_commitments"`
-	Share          []byte   `json:"share"`
-	OTSenderSX     []byte   `json:"ot_sender_s_x"`
-	OTSenderSY     []byte   `json:"ot_sender_s_y"`
-	OTSenderPokAX  []byte   `json:"ot_sender_pok_alpha_x"`
-	OTSenderPokAY  []byte   `json:"ot_sender_pok_alpha_y"`
-	OTSenderPokT   []byte   `json:"ot_sender_pok_t"`
+}
+
+// refreshR1Unicast is the round-1 UNICAST half: per-recipient share +
+// this dealer's base-OT-Sender first-round message.
+type refreshR1Unicast struct {
+	Share         []byte `json:"share"`
+	OTSenderSX    []byte `json:"ot_sender_s_x"`
+	OTSenderSY    []byte `json:"ot_sender_s_y"`
+	OTSenderPokAX []byte `json:"ot_sender_pok_alpha_x"`
+	OTSenderPokAY []byte `json:"ot_sender_pok_alpha_y"`
+	OTSenderPokT  []byte `json:"ot_sender_pok_t"`
 }
 
 const (
-	refreshTypeR1 = "dkls:refresh:r1"
-	refreshTypeR2 = "dkls:refresh:r2"
+	refreshTypeR1Bcast   = "dkls:refresh:r1bc"
+	refreshTypeR1Unicast = "dkls:refresh:r1uc"
+	refreshTypeR2        = "dkls:refresh:r2"
 )
 
 func refreshSession(params *tss.Parameters, key *Key) []byte {

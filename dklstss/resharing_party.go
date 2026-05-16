@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -39,6 +40,18 @@ type ResharingParty struct {
 	ctx    context.Context
 	params *tss.Parameters
 
+	// oldECDSAPub is the public key of the committee being resharded.
+	// Every party (OLD, NEW, OLD+NEW) must agree on this value out of
+	// band so:
+	//   - all parties compute the same ssid for the base-OT setup that
+	//     follows (fixes the H-2 partial-overlap mismatch where hybrids
+	//     had oldKey and NEW-only parties didn't);
+	//   - the new committee can reject a malicious OLD participant who
+	//     ships VSS shares whose sum reconstructs to a different pub
+	//     (fixes C-1: without this binding, a single OLD party could
+	//     rotate the joint key to any value of their choosing).
+	oldECDSAPub *crypto.ECPoint
+
 	// OLD role.
 	isOld         bool
 	oldKey        *Key
@@ -60,6 +73,17 @@ type ResharingParty struct {
 	newOTRcv        map[string]*baseot.Receiver
 	myDelta         map[string][]byte
 
+	// Round-1 join state on the NEW side. OLD participants now ship
+	// their VSS commitments as a To==nil broadcast (so equivocation
+	// is closed at the broker layer) and the per-recipient share as a
+	// unicast. afterRound1 cannot run until both halves arrive from
+	// every OLD participant; the atomic counter goes 0 → 1 → 2 and the
+	// goroutine that reaches 2 fires the rest of the protocol.
+	r1JoinCount atomic.Int32
+	r1Bcasts    []*reshareR1Bcast
+	r1Unicasts  []*reshareR1Unicast
+	r1OldIds    []*tss.PartyID
+
 	Done chan *Key
 	Err  chan error
 }
@@ -73,6 +97,14 @@ type ResharingParty struct {
 //
 // One or both roles must be set; otherwise the call returns an error.
 //
+// oldECDSAPub is the public key of the committee being resharded. It
+// must be supplied to every party — OLD participants normally pass
+// oldKey.ECDSAPub; NEW-only participants must learn it out of band
+// (typically from the same channel that delivers oldSubset). This
+// binding is the SECURITY hinge of the protocol: without it a single
+// malicious OLD participant can rotate the joint key to any pub of
+// their choosing, and NEW-only parties have no local way to detect it.
+//
 // oldKey may be nil for parties that are only NEW. oldSubset must
 // contain at least oldKey.T+1 distinct members (the active subset),
 // and lagrange coefficients are computed across those members.
@@ -82,6 +114,7 @@ type ResharingParty struct {
 func NewResharing(
 	ctx context.Context,
 	params *tss.Parameters,
+	oldECDSAPub *crypto.ECPoint,
 	oldKey *Key,
 	oldSubset tss.SortedPartyIDs,
 	newSubset tss.SortedPartyIDs,
@@ -89,6 +122,9 @@ func NewResharing(
 ) (*ResharingParty, error) {
 	if ctx == nil || params == nil {
 		return nil, errors.New("dklstss: NewResharing nil argument")
+	}
+	if oldECDSAPub == nil || !oldECDSAPub.ValidateBasic() {
+		return nil, errors.New("dklstss: NewResharing requires oldECDSAPub (the public key being resharded) to be a valid curve point")
 	}
 	if !tss.SameCurve(params.EC(), tss.S256()) {
 		return nil, errors.New("dklstss: NewResharing requires secp256k1")
@@ -123,6 +159,13 @@ func NewResharing(
 		if len(oldSubset) < oldKey.T+1 {
 			return nil, fmt.Errorf("dklstss: NewResharing oldSubset size %d < T+1=%d", len(oldSubset), oldKey.T+1)
 		}
+		if !oldECDSAPub.Equals(oldKey.ECDSAPub) {
+			// Catch caller bugs where oldECDSAPub was passed in
+			// inconsistent with the OLD party's local oldKey. The
+			// security hinge depends on oldECDSAPub being correct;
+			// fail loudly rather than proceed with a mismatched view.
+			return nil, errors.New("dklstss: NewResharing oldECDSAPub does not match oldKey.ECDSAPub")
+		}
 	}
 	if isNew {
 		if newThreshold < 1 || newThreshold >= len(newSubset) {
@@ -133,6 +176,7 @@ func NewResharing(
 	rp := &ResharingParty{
 		ctx:             ctx,
 		params:          params,
+		oldECDSAPub:     oldECDSAPub,
 		isOld:           isOld,
 		oldKey:          oldKey,
 		oldSubset:       oldSubset,
@@ -140,7 +184,7 @@ func NewResharing(
 		newSubset:       newSubset,
 		newThreshold:    newThreshold,
 		myNewIdx:        myNewIdx,
-		ssid:            resharingSession(params, oldKey, oldSubset, newSubset, newThreshold),
+		ssid:            resharingSession(params, oldECDSAPub, oldSubset, newSubset, newThreshold),
 		receivedShares:  make(map[string]*big.Int),
 		receivedCommits: make(map[string]vss.Vs),
 		newOTSnd:        make(map[string]*baseot.Sender),
@@ -173,9 +217,11 @@ func NewResharing(
 
 	// Register NEW-side receivers first (so messages aren't dropped).
 	if isNew {
-		// Round 1 expects shares from EVERY old subset member.
-		rcv := tss.NewJsonExpect[reshareR1](reshareTypeR1, []*tss.PartyID(oldSubset), rp.afterRound1)
-		params.Broker().Connect(reshareTypeR1, rcv)
+		rp.r1OldIds = []*tss.PartyID(oldSubset)
+		rcvBcast := tss.NewJsonExpect[reshareR1Bcast](reshareTypeR1Bcast, rp.r1OldIds, rp.onR1Bcast)
+		rcvUnicast := tss.NewJsonExpect[reshareR1Unicast](reshareTypeR1Unicast, rp.r1OldIds, rp.onR1Unicast)
+		params.Broker().Connect(reshareTypeR1Bcast, rcvBcast)
+		params.Broker().Connect(reshareTypeR1Unicast, rcvUnicast)
 	}
 
 	// OLD-side: kick off round 1 immediately.
@@ -226,14 +272,23 @@ func (rp *ResharingParty) oldRound1() error {
 	}
 	encVs := flattenPointXY(Vs)
 
+	// BROADCAST: Vs commitments. Identical bytes for every recipient,
+	// sent via To==nil so the broker contract gives the NEW committee
+	// a single canonical view per OLD party (closes the equivocation
+	// hole H-3 also called out in the audit). The broker contract is
+	// the same as for keygen_party — see that file for the rationale.
+	bcast := &reshareR1Bcast{VSSCommitments: encVs}
+	bm := tss.JsonWrap(reshareTypeR1Bcast, bcast, Pi, nil)
+	if err := rp.params.Broker().Receive(bm); err != nil {
+		return fmt.Errorf("broker r1-bcast: %w", err)
+	}
+
+	// UNICAST: per-recipient share (peer-specific).
 	for n, Pj := range rp.newSubset {
-		r1 := &reshareR1{
-			VSSCommitments: encVs,
-			Share:          shares[n].Share.Bytes(),
-		}
-		m := tss.JsonWrap(reshareTypeR1, r1, Pi, Pj)
+		uc := &reshareR1Unicast{Share: shares[n].Share.Bytes()}
+		m := tss.JsonWrap(reshareTypeR1Unicast, uc, Pi, Pj)
 		if err := rp.params.Broker().Receive(m); err != nil {
-			return fmt.Errorf("broker r1→%s: %w", Pj, err)
+			return fmt.Errorf("broker r1-uc→%s: %w", Pj, err)
 		}
 	}
 	// Old-only parties also signal completion now.
@@ -243,9 +298,25 @@ func (rp *ResharingParty) oldRound1() error {
 	return nil
 }
 
+// onR1Bcast / onR1Unicast: NEW-side join of round 1. See keygen_party.go
+// for the broker-contract rationale.
+func (rp *ResharingParty) onR1Bcast(oldIds []*tss.PartyID, msgs []*reshareR1Bcast) {
+	rp.r1Bcasts = msgs
+	if rp.r1JoinCount.Add(1) == 2 {
+		rp.afterRound1(oldIds)
+	}
+}
+
+func (rp *ResharingParty) onR1Unicast(oldIds []*tss.PartyID, msgs []*reshareR1Unicast) {
+	rp.r1Unicasts = msgs
+	if rp.r1JoinCount.Add(1) == 2 {
+		rp.afterRound1(oldIds)
+	}
+}
+
 // afterRound1 fires on the NEW side once shares from every old subset
 // member have arrived. Verify, aggregate Xi, kick off pairwise OT.
-func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID, msgs []*reshareR1) {
+func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
 		rp.Err <- err
 		return
@@ -253,21 +324,24 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID, msgs []*reshareR1) 
 	Pi := rp.params.PartyID()
 	ec := rp.params.EC()
 	q := ec.Params().N
+	bcasts := rp.r1Bcasts
+	ucs := rp.r1Unicasts
 
 	// Verify shares + collect commitments.
 	for n, pid := range oldIds {
-		r1 := msgs[n]
-		if len(r1.VSSCommitments) != 2*(rp.newThreshold+1) {
+		bc := bcasts[n]
+		uc := ucs[n]
+		if len(bc.VSSCommitments) != 2*(rp.newThreshold+1) {
 			rp.Err <- fmt.Errorf("party %s sent %d Vs coords, expected %d",
-				pid, len(r1.VSSCommitments), 2*(rp.newThreshold+1))
+				pid, len(bc.VSSCommitments), 2*(rp.newThreshold+1))
 			return
 		}
-		vsj, err := unflattenPointXY(ec, r1.VSSCommitments)
+		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
 			rp.Err <- fmt.Errorf("party %s Vs decode: %w", pid, err)
 			return
 		}
-		shareInt := new(big.Int).SetBytes(r1.Share)
+		shareInt := new(big.Int).SetBytes(uc.Share)
 		sh := &vss.Share{Threshold: rp.newThreshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, rp.newThreshold, vsj) {
 			rp.Err <- fmt.Errorf("party %s reshare-share verification failed", pid)
@@ -390,7 +464,12 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 	n := len(rp.newSubset)
 
 	// Reconstruct ECDSAPub from old commitments — Σ V_old_i[0] equals
-	// (Σ scaled_share_i) · G = secret · G = oldKey.ECDSAPub.
+	// (Σ scaled_share_i) · G = secret · G = oldECDSAPub when the OLD
+	// participants act honestly. Verify this binding; a mismatch means
+	// at least one OLD party shipped a polynomial whose constant term
+	// is not λ_i · x_i (C-1: a malicious OLD party could otherwise
+	// rotate the new committee onto an unrelated public key without any
+	// other party noticing).
 	var pub *crypto.ECPoint
 	for _, Vs := range rp.receivedCommits {
 		if pub == nil {
@@ -404,6 +483,13 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 			pub = next
 		}
 	}
+	if pub == nil || !pub.Equals(rp.oldECDSAPub) {
+		rp.Err <- errors.New("dklstss: reshare reconstructed public key does not match the advertised oldECDSAPub — at least one OLD participant shipped a malformed VSS commitment")
+		return
+	}
+	// From here on, downstream code uses oldECDSAPub for the new Key's
+	// ECDSAPub field. The aggregated value above was only the witness.
+	pub = rp.oldECDSAPub
 
 	// BigXj[j] = sum of (Vs[k] · id_j^k) over all old participants.
 	// Evaluating the summed polynomial at id_j.
@@ -486,10 +572,18 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 	rp.Done <- key
 }
 
-// reshareR1 carries an old participant's VSS commitments + recipient share.
-type reshareR1 struct {
+// reshareR1Bcast is the OLD→NEW round-1 BROADCAST: Vs commitments
+// (same bytes for every recipient). Sent via To==nil to close the
+// equivocation hole: a malicious OLD party cannot ship different
+// commitments to different NEW members under the broker contract.
+type reshareR1Bcast struct {
 	VSSCommitments [][]byte `json:"vss_commitments"`
-	Share          []byte   `json:"share"`
+}
+
+// reshareR1Unicast is the OLD→NEW round-1 UNICAST half: the
+// per-recipient share evaluated at the recipient's id.
+type reshareR1Unicast struct {
+	Share []byte `json:"share"`
 }
 
 // reshareR2 is a new-committee party's base-OT-Sender message to a peer.
@@ -502,23 +596,29 @@ type reshareR2 struct {
 }
 
 const (
-	reshareTypeR1 = "dkls:reshare:r1" // OLD → NEW: VSS+share
-	reshareTypeR2 = "dkls:reshare:r2" // NEW → NEW: base-OT-Sender
-	reshareTypeR3 = "dkls:reshare:r3" // NEW → NEW: base-OT-Receiver-R
+	reshareTypeR1Bcast   = "dkls:reshare:r1bc" // OLD → NEW (broadcast): Vs
+	reshareTypeR1Unicast = "dkls:reshare:r1uc" // OLD → NEW (unicast): share
+	reshareTypeR2        = "dkls:reshare:r2"   // NEW → NEW: base-OT-Sender
+	reshareTypeR3        = "dkls:reshare:r3"   // NEW → NEW: base-OT-Receiver-R
 )
 
-func resharingSession(params *tss.Parameters, oldKey *Key, oldSubset, newSubset tss.SortedPartyIDs, newThreshold int) []byte {
+func resharingSession(params *tss.Parameters, oldECDSAPub *crypto.ECPoint, oldSubset, newSubset tss.SortedPartyIDs, newThreshold int) []byte {
 	// As with refreshSession, the resharing protocol only runs base-OT
 	// setup (no signing-time ΠMul), so even if two resharings produce
 	// the same ssid the resulting OT-extension seeds differ due to
 	// fresh internal randomness in base-OT. Encoding newThreshold as
 	// big-endian 4 bytes (was byte()) so values >= 256 cannot collide.
+	//
+	// oldECDSAPub is unconditional here — every party (OLD, NEW,
+	// OLD+NEW) must supply it via the NewResharing parameter, which is
+	// what closes the partial-overlap mismatch flagged by H-2. The
+	// constructor refuses nil oldECDSAPub.
 	h := sha256.New()
-	h.Write([]byte("DKLS23-reshare-party-v1-"))
-	if oldKey != nil {
-		h.Write(oldKey.ECDSAPub.X().Bytes())
-		h.Write(oldKey.ECDSAPub.Y().Bytes())
-	}
+	h.Write([]byte("DKLS23-reshare-party-v2-"))
+	h.Write(oldECDSAPub.X().Bytes())
+	h.Write([]byte{'|'})
+	h.Write(oldECDSAPub.Y().Bytes())
+	h.Write([]byte{'|'})
 	for _, p := range oldSubset {
 		h.Write(p.KeyInt().Bytes())
 		h.Write([]byte{0})

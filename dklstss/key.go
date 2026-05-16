@@ -1,13 +1,13 @@
 package dklstss
 
 import (
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"errors"
 	"fmt"
 	"math/big"
 
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/ctmul"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/ot/otext"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
@@ -23,8 +23,16 @@ import (
 // invocation to its caller-supplied sid (see crypto/ot/otext/prg.go),
 // and dklstss/signing_party.go mixes each signing's random K_i values
 // into that sid so consecutive signings can never collide on it.
-// Identity material (Ed25519 long-term keys for transcript signing) is
-// also persisted by Save when KeygenWithIdentities was used.
+//
+// Peer authentication is OUTSIDE the scope of this package. The
+// broker-driven Party state machines trust whatever tss.MessageBroker
+// implementation the caller wires in to authenticate message origin;
+// pinning peer identities, signing transport-level messages, and
+// detecting equivocating peers are the implementor's job. Earlier
+// revisions exposed Ed25519 "identity key" helpers (KeygenWithIdentities,
+// SignTranscript, VerifyTranscript) that hinted at automatic
+// identifiable abort — that surface was removed because the parties did
+// not in fact use it.
 type Key struct {
 	Curve    elliptic.Curve   `json:"-"`
 	N        int              // total number of parties
@@ -55,24 +63,6 @@ type Key struct {
 	// output) level. Used for non-hardened HD derivation. Deterministic
 	// function of the joint public key; identical across all parties.
 	ChainCode []byte
-
-	// IdentityPub is the local party's long-term identity public key,
-	// used to sign outgoing protocol messages so the receiver can prove
-	// to a third party which peer originated a deviating message.
-	// Populated by KeygenWithIdentities; nil when Keygen is called
-	// without identities (the synchronous in-process API doesn't need
-	// them, but the broker-driven API will).
-	IdentityPub ed25519.PublicKey
-
-	// IdentityPriv is the local party's long-term identity private key.
-	// Treat as sensitive material; zero on disposal. Populated only by
-	// KeygenWithIdentities.
-	IdentityPriv ed25519.PrivateKey
-
-	// PeerIdentityPubs[i] is the public identity key of party i (across
-	// the full committee). Required for verifying signed transcripts
-	// during identifiable-abort flows.
-	PeerIdentityPubs []ed25519.PublicKey
 }
 
 // PairOTState bundles the two directions of OT extension between the
@@ -143,6 +133,21 @@ func (k *Key) ValidateBasic() error {
 	}
 	if len(k.ChainCode) != 32 {
 		return fmt.Errorf("dklstss: ChainCode must be 32 bytes, got %d", len(k.ChainCode))
+	}
+	// Algebraic consistency: Xi · G must equal BigXj[Idx]. The
+	// per-field range checks above don't catch a tampered Xi or a
+	// mismatched BigXj entry — Load (and any in-memory mutation that
+	// breaks the share/commitment binding) is otherwise silent, and a
+	// signing run with the bad share emits a non-verifying signature
+	// without surfacing the corruption (see byzantine_test.go's tampered
+	// share test). Route the scalar mult through ctmul so callers that
+	// trigger ValidateBasic in a timing-sensitive path do not leak Xi.
+	if k.BigXj[k.Idx] == nil {
+		return fmt.Errorf("dklstss: BigXj[Idx=%d] is nil", k.Idx)
+	}
+	expectXi := ctmul.ScalarBaseMult(k.Curve, k.Xi)
+	if !expectXi.Equals(k.BigXj[k.Idx]) {
+		return errors.New("dklstss: Xi · G does not equal BigXj[Idx] — share / public-commitment binding broken")
 	}
 	return nil
 }
