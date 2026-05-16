@@ -248,23 +248,37 @@ After success, `pk.Verify(result.Signature, msg, msgCtx)` (on the same `*mldsa.P
 
 ### DKLs23 Threshold ECDSA on secp256k1 (experimental)
 
-The `dklstss` package implements [Doerner, Kondi, Lee, Shelat 2023 — *Threshold ECDSA in Three Rounds*](https://eprint.iacr.org/2023/765) as an alternative to the GG18-based `ecdsatss` package. DKLs23 replaces Paillier/MtA with OT-based multiplication (Gilboa over IKNP/KOS-style OT extension), eliminating the entire RSA-proof attack surface that produced TSSHOCK, Alpha-Rays, and related attacks against GG18 deployments.
+The `dklstss` package implements [Doerner, Kondi, Lee, Shelat 2023 — *Threshold ECDSA in Three Rounds*](https://eprint.iacr.org/2023/765) as an alternative to the GG18-based `ecdsatss` package. DKLs23 replaces Paillier/MtA with OT-based multiplication (Gilboa over IKNP/KOS-style OT extension), eliminating the entire RSA-proof attack surface that produced TSSHOCK, Alpha-Rays, and related disclosed attacks against GG18 deployments.
 
-⚠️ **Pre-audit and partial.** This package has NOT received external cryptographic review and is intended as a reference implementation. Several known gaps remain — see [`dklstss/doc.go`](dklstss/doc.go) for the complete list:
+⚠️ **Pre-audit.** Not externally reviewed; intended for integration testing pending audit. See [`dklstss/doc.go`](dklstss/doc.go) for the full security writeup.
 
-- Secret-scalar multiplications (signing nonces k<sub>i</sub>, base-OT sender trapdoor y) route through `crypto/ctmul`, a Montgomery ladder over secp256k1 Jacobian coordinates with Z-coordinate randomization, 64-bit scalar blinding, and byte-level constant-time conditional swap. The residual side-channel is `AddNonConst`'s identity-point fast path at the very start of the ladder; scalar blinding ensures any observable timing there leaks high bits of the blinded scalar, not the secret. See `crypto/ctmul/doc.go` for the full threat-model writeup.
-- ΠMul has malicious-receiver security via the OT extension's KOS-style consistency check, plus a cross-run consistency Mul-then-check that catches "Bob uses different β across parallel runs". Consistent-wrong-β by Bob is caught at the signing layer by ECDSA verification.
-- Two API styles. Synchronous in-process: `Keygen`, `Sign`, `SignChecked`, `Presign`, `SignWithPresign`, `Refresh`, `Reshare`, `DeriveAndSign` for tests and direct integration. Broker-driven distributed: `NewKeygen` / `NewSigning` / `NewPresign` / `NewRefresh` / `NewResharing` each return a per-party state machine that exchanges messages via `tss.MessageBroker`, matching the `ecdsatss`/`frosttss` convention. Each Party type has `Done` and `Err` channels; the protocol completes asynchronously as messages flow through the broker.
+Capabilities:
 
-Current scope:
+- **t-of-n DKG** producing standard secp256k1 ECDSA keys
+- **Signing** — combined (`Sign`) or split into offline `Presign` + online `SignWithPresign`. The online phase is a single round costing microseconds per signature
+- **Single-use presigning** — atomic CAS in-memory plus `UsedPresignStore` interface for caller-provided durable nonce-tracking (presign reuse = nonce reuse = key extraction)
+- **Proactive refresh** rotating shares AND OT-extension state without changing the public key
+- **Resharing** to a new committee (different N, T, members) preserving the public key
+- **BIP32 non-hardened HD derivation** at sign time
+- **Malicious-secure signing** (`SignChecked`) — DKLs23 §5 Mul-then-check with `tss.Error.Culprits` populated on cross-run β-inconsistency
+- **Long-term identity keys** (Ed25519, via `KeygenWithIdentities`) for transcript signing
+- **Key Save/Load** with versioned schema for persistence
+- **Constant-time scalar multiplication** for secret scalars (Montgomery ladder + Z-randomization + scalar blinding + byte-level cswap, see [`crypto/ctmul/doc.go`](crypto/ctmul/doc.go))
 
-- t-of-n distributed key generation (Feldman VSS based)
-- t+1-party signing producing standard ECDSA signatures verifiable by `crypto/ecdsa.Verify`
-- Separate pre-signing (offline) and online signing phases, with **single-use enforcement** on the presign output (re-using a presign is equivalent to ECDSA nonce reuse and leaks the private key)
-- Proactive share refresh (rotates shares AND OT extension state without changing the public key)
-- BIP32 non-hardened HD derivation at sign time (hardened indices are impossible without the raw private key and are rejected)
+Two API styles are provided for every protocol:
 
-Combined (online) signing:
+| Synchronous (in-process) | Broker-driven (distributed) |
+|---|---|
+| `Keygen` | `NewKeygen` → `*KeygenParty` |
+| `Sign`, `SignChecked`, `SignWithTweak` | `NewSigning` → `*SigningParty` |
+| `Presign`, `SignWithPresign`, `SignWithPresignDurable` | `NewPresign` → `*PresignParty` |
+| `Refresh` | `NewRefresh` → `*RefreshParty` |
+| `Reshare` | `NewResharing` → `*ResharingParty` |
+| `DeriveAndSign`, `DeriveChild` | (compose with `*SigningParty` and a tweak) |
+
+The synchronous variants run all parties in the caller's goroutine — suited to tests and direct integration. The broker-driven variants are per-party state machines that exchange messages via `tss.MessageBroker`, matching the `ecdsatss`/`frosttss` convention. Each Party type has `Done` and `Err` channels.
+
+Synchronous combined signing:
 
 ```go
 import "github.com/KarpelesLab/tss-lib/v2/dklstss"
@@ -278,25 +292,20 @@ digest := sha256.Sum256(message)
 sig, err := dklstss.Sign(keys, []int{0, 2, 4}, digest[:], rand.Reader)
 
 // Standard ECDSA signature; verify with stdlib.
-pub := &ecdsa.PublicKey{
-    Curve: keys[0].ECDSAPub.Curve(),
-    X:     keys[0].ECDSAPub.X(),
-    Y:     keys[0].ECDSAPub.Y(),
-}
+pub := &ecdsa.PublicKey{Curve: keys[0].ECDSAPub.Curve(), X: keys[0].ECDSAPub.X(), Y: keys[0].ECDSAPub.Y()}
 ok := ecdsa.Verify(pub, digest[:], sig.R, sig.S)
 ```
 
-Pre-signing + online signing (single-use enforced):
+Pre-signing + online signing with durable single-use enforcement:
 
 ```go
-// Offline phase — produces a single-use presign output bound to (pub, R).
+store := myCaller.PresignStore() // implements dklstss.UsedPresignStore (backed by your KV / DB)
+
+// Offline: produces a single-use presign bound to (pub, R).
 presign, err := dklstss.Presign(keys, []int{0, 2, 4}, rand.Reader)
 
-// Online phase — atomic CAS makes presign consumable exactly once.
-sig, err := dklstss.SignWithPresign(presign, digest[:], nil)
-
-// Second call returns dklstss.ErrPresignAlreadyConsumed.
-_, err = dklstss.SignWithPresign(presign, digest[:], nil)
+// Online: store-backed CAS rejects reuse across process restarts.
+sig, err := dklstss.SignWithPresignDurable(presign, digest[:], nil, store)
 ```
 
 HD wallet (BIP32 non-hardened):
@@ -312,7 +321,38 @@ Proactive refresh:
 ```go
 refreshed, err := dklstss.Refresh(keys, rand.Reader)
 // Public key unchanged; per-party shares + OT extension state rotated.
-// Subsequent signings must use the refreshed slice.
+```
+
+Resharing to a new committee:
+
+```go
+// Old 2-of-3 committee reshares to a fresh 3-of-5 committee with new IDs.
+newKeys, err := dklstss.Reshare(oldKeys, []int{0, 1}, newPartyIDs, 2, rand.Reader)
+// Public key unchanged; old committee can discard its shares.
+```
+
+Broker-driven distributed signing (per-party — each `*SigningParty` runs in its own goroutine/process):
+
+```go
+params := tss.NewParameters(tss.S256(), peerCtx, myPartyID, partyCount, threshold)
+params.SetBroker(myNetworkBroker) // implements tss.MessageBroker
+
+sp, err := dklstss.NewSigning(ctx, params, myKey, digest[:], signingSubset, nil)
+select {
+case sig := <-sp.Done:
+    // sig.R / sig.S verify under myKey.ECDSAPub
+case err := <-sp.Err:
+    // identifiable abort: if err.(*tss.Error).Culprits() is non-empty,
+    // that peer's misbehavior was caught by Mul-then-check
+}
+```
+
+Persistence:
+
+```go
+var buf bytes.Buffer
+_ = key.Save(&buf)              // versioned JSON, includes OT extension state
+loaded, _ := dklstss.Load(&buf) // round-trips for signing
 ```
 
 ## Migration from Legacy API (v2.1 and earlier)

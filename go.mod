@@ -7,6 +7,7 @@ require (
 	github.com/KarpelesLab/edwards25519 v1.1.7
 	github.com/KarpelesLab/mldsa v0.1.3
 	github.com/KarpelesLab/secp256k1 v0.2.8
+	github.com/gtank/ristretto255 v0.2.0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/ipfs/go-log v1.0.5
 	github.com/stretchr/testify v1.8.4
@@ -15,10 +16,9 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/ipfs/go-log/v2 v2.1.3 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect

@@ -6,7 +6,14 @@
 // to provide:
 //   - n-party t-of-n distributed key generation (Feldman VSS based)
 //   - t+1-party threshold signing producing standard ECDSA signatures
+//   - Pre-signing as a separate offline phase with single-use online sign
+//   - Proactive share + OT-extension refresh
+//   - Resharing to a new committee (different N, T, members) preserving
+//     the public key
 //   - HD wallet derivation (BIP32 non-hardened) at sign time
+//   - Malicious-secure signing (Mul-then-check) with identifiable abort
+//   - Long-term identity keys (Ed25519) for transcript signing
+//   - Versioned Key Save/Load for persistence
 //
 // Compared to the existing GG18-based ecdsatss/ package, dklstss/ has no
 // Paillier/MtA layer — the multiplicative-to-additive subprotocol is built
@@ -40,11 +47,12 @@
 // atomic CAS to enforce single-use, so concurrent SignWithPresign
 // calls on the same presign are race-safe (exactly one succeeds).
 //
-// SECURITY STATUS — PRE-AUDIT and PARTIAL.
+// SECURITY STATUS — PRE-AUDIT.
 //
 // This implementation has NOT received external cryptographic review and
-// SHOULD NOT be used in production. Several known gaps remain (each
-// tracked in the project task list):
+// SHOULD NOT be used in production until that audit completes. The
+// protocol surface is feature-complete; what follows is the threat-model
+// summary callers should weigh before deployment:
 //
 //   - Secret-scalar multiplications (signing nonces k_i, base-OT sender
 //     trapdoor y) route through crypto/ctmul, which implements a
@@ -52,20 +60,22 @@
 //     randomization, 64-bit scalar blinding, and byte-level constant-time
 //     conditional swap. See ctmul/doc.go for the threat-model details
 //     and the residual identity-branch caveat.
-//   - ΠMul provides malicious-receiver security via the OT extension's
-//     consistency check, but malicious-sender security (DKLs23 §5's
-//     "Mul-then-check") is task #17. A malicious Bob can today cause Alice
-//     to compute wrong shares (correctness break / DoS, not key
-//     extraction).
-//   - Pre-signing as a separate offline phase is task #12. The current
-//     API offers only combined (online) signing.
-//   - Proactive share refresh is task #13.
-//   - Broker-based async API matching ecdsatss/ is task #7. Today's API
-//     is synchronous and intended for tests and direct integration. The
-//     wire-message Go structs are defined in msgkeygen.go, msgsigning.go,
-//     and msgrefresh.go for the future broker-driven Party state machine
-//     to use via tss.JsonWrap / tss.NewJsonExpect, matching the existing
-//     convention used by ecdsatss/eddsatss/frosttss.
+//   - ΠMul is malicious-secure against the receiver via the OT extension's
+//     KOS-style consistency check, and against the sender via DKLs23 §5
+//     "Mul-then-check" (cross-run β-consistency). SignChecked surfaces
+//     check failures as tss.Error with Culprits populated; in plain Sign,
+//     a malicious party's wrong shares are caught one layer up by ECDSA
+//     signature verification.
+//   - Pre-sign single-use is enforced in two layers: an in-memory atomic
+//     CAS on PresignOutput, and an optional UsedPresignStore interface
+//     for caller-provided durable nonce-commitment tracking across
+//     process restarts (SignWithPresignDurable). The library does not
+//     prescribe a storage backend — that is the caller's responsibility.
+//   - Identifiable abort relies on Ed25519 transcript signatures bound to
+//     long-term identity keys established at keygen
+//     (KeygenWithIdentities). Without identity keys, blame can still be
+//     assigned for cryptographic misbehavior caught by Mul-then-check,
+//     but not for transport-level equivocation.
 //
 // References:
 //   - J. Doerner, Y. Kondi, E. Lee, A. Shelat. "Threshold ECDSA in Three
