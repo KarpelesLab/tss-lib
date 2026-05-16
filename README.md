@@ -246,6 +246,75 @@ case err := <-s.Err:
 
 After success, `pk.Verify(result.Signature, msg, msgCtx)` (on the same `*mldsa.PublicKey44` returned by the trusted dealer) will return true.
 
+### DKLs23 Threshold ECDSA on secp256k1 (experimental)
+
+The `dklstss` package implements [Doerner, Kondi, Lee, Shelat 2023 — *Threshold ECDSA in Three Rounds*](https://eprint.iacr.org/2023/765) as an alternative to the GG18-based `ecdsatss` package. DKLs23 replaces Paillier/MtA with OT-based multiplication (Gilboa over IKNP/KOS-style OT extension), eliminating the entire RSA-proof attack surface that produced TSSHOCK, Alpha-Rays, and related attacks against GG18 deployments.
+
+⚠️ **Pre-audit and partial.** This package has NOT received external cryptographic review and is intended as a reference implementation. Several known gaps remain — see [`dklstss/doc.go`](dklstss/doc.go) for the complete list:
+
+- Secret-scalar multiplications (signing nonces k<sub>i</sub>, base-OT sender trapdoor y) route through `crypto/ctmul`, a Montgomery ladder over secp256k1 Jacobian coordinates with Z-coordinate randomization, 64-bit scalar blinding, and byte-level constant-time conditional swap. The residual side-channel is `AddNonConst`'s identity-point fast path at the very start of the ladder; scalar blinding ensures any observable timing there leaks high bits of the blinded scalar, not the secret. See `crypto/ctmul/doc.go` for the full threat-model writeup.
+- ΠMul has malicious-receiver security via the OT extension's KOS-style consistency check, plus a cross-run consistency Mul-then-check that catches "Bob uses different β across parallel runs". Consistent-wrong-β by Bob is caught at the signing layer by ECDSA verification.
+- Two API styles. Synchronous in-process: `Keygen`, `Sign`, `SignChecked`, `Presign`, `SignWithPresign`, `Refresh`, `Reshare`, `DeriveAndSign` for tests and direct integration. Broker-driven distributed: `NewKeygen` / `NewSigning` / `NewPresign` / `NewRefresh` / `NewResharing` each return a per-party state machine that exchanges messages via `tss.MessageBroker`, matching the `ecdsatss`/`frosttss` convention. Each Party type has `Done` and `Err` channels; the protocol completes asynchronously as messages flow through the broker.
+
+Current scope:
+
+- t-of-n distributed key generation (Feldman VSS based)
+- t+1-party signing producing standard ECDSA signatures verifiable by `crypto/ecdsa.Verify`
+- Separate pre-signing (offline) and online signing phases, with **single-use enforcement** on the presign output (re-using a presign is equivalent to ECDSA nonce reuse and leaks the private key)
+- Proactive share refresh (rotates shares AND OT extension state without changing the public key)
+- BIP32 non-hardened HD derivation at sign time (hardened indices are impossible without the raw private key and are rejected)
+
+Combined (online) signing:
+
+```go
+import "github.com/KarpelesLab/tss-lib/v2/dklstss"
+
+// DKG: 3-of-5 threshold (signing requires any 3 of 5 parties).
+partyIDs := tss.SortPartyIDs(/* … */)
+keys, err := dklstss.Keygen(5, 2, partyIDs, rand.Reader)
+
+// Sign with parties 0, 2, 4 (any T+1 subset works).
+digest := sha256.Sum256(message)
+sig, err := dklstss.Sign(keys, []int{0, 2, 4}, digest[:], rand.Reader)
+
+// Standard ECDSA signature; verify with stdlib.
+pub := &ecdsa.PublicKey{
+    Curve: keys[0].ECDSAPub.Curve(),
+    X:     keys[0].ECDSAPub.X(),
+    Y:     keys[0].ECDSAPub.Y(),
+}
+ok := ecdsa.Verify(pub, digest[:], sig.R, sig.S)
+```
+
+Pre-signing + online signing (single-use enforced):
+
+```go
+// Offline phase — produces a single-use presign output bound to (pub, R).
+presign, err := dklstss.Presign(keys, []int{0, 2, 4}, rand.Reader)
+
+// Online phase — atomic CAS makes presign consumable exactly once.
+sig, err := dklstss.SignWithPresign(presign, digest[:], nil)
+
+// Second call returns dklstss.ErrPresignAlreadyConsumed.
+_, err = dklstss.SignWithPresign(presign, digest[:], nil)
+```
+
+HD wallet (BIP32 non-hardened):
+
+```go
+path := []uint32{44, 0, 0, 0, 7}
+sig, childPub, err := dklstss.DeriveAndSign(keys, []int{0, 2, 4}, path, digest[:], rand.Reader)
+// Verify under childPub, not keys[0].ECDSAPub.
+```
+
+Proactive refresh:
+
+```go
+refreshed, err := dklstss.Refresh(keys, rand.Reader)
+// Public key unchanged; per-party shares + OT extension state rotated.
+// Subsequent signings must use the refreshed slice.
+```
+
 ## Migration from Legacy API (v2.1 and earlier)
 
 The `ecdsa/keygen`, `ecdsa/signing`, `ecdsa/resharing`, `eddsa/keygen`, `eddsa/signing`, and `eddsa/resharing` packages are now **deprecated**. They still work but will not receive new features.
