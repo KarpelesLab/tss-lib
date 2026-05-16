@@ -16,13 +16,23 @@
 //     across parallel ΠMul runs)
 //   - Versioned Key Save/Load for persistence
 //
-// Peer authentication is OUT OF SCOPE. The broker-driven Party state
+// Peer AUTHENTICATION is OUT OF SCOPE. The broker-driven Party state
 // machines trust whatever tss.MessageBroker implementation the caller
 // supplies to authenticate message origin. Pinning peer identities,
-// signing transport-level messages, and detecting equivocating peers
-// are the implementor's responsibility. Earlier revisions of this
-// package exposed Ed25519 identity-key helpers; those were removed
-// because the parties did not in fact bind them to round messages.
+// signing transport-level messages, and rejecting tampered bytes are
+// the implementor's responsibility. Earlier revisions of this package
+// exposed Ed25519 identity-key helpers; those were removed because the
+// parties did not in fact bind them to round messages.
+//
+// Peer EQUIVOCATION (a malicious peer running tampered library code
+// that ships different VSS commitments to different recipients under
+// a single To==nil broadcast) is caught CRYPTOGRAPHICALLY by the
+// echo-broadcast phase in keygen / refresh / reshare: every recipient
+// broadcasts a SHA-256 digest of every dealer's commitments as it
+// received them, and any pair of disagreeing digests aborts the
+// protocol with the offending dealer's PartyID returned in the
+// *tss.Error's Culprits(). This holds without any trust in the
+// broker's broadcast semantics — see dklstss/echo.go.
 //
 // Compared to the existing GG18-based ecdsatss/ package, dklstss/ has no
 // Paillier/MtA layer — the multiplicative-to-additive subprotocol is built

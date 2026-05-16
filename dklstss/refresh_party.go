@@ -53,14 +53,17 @@ type RefreshParty struct {
 
 	// Round-1 join state. Like KeygenParty, the VSS commitments arrive
 	// as a broadcast and the share + OT-base-sender material arrives
-	// as a unicast; round2 cannot run until both halves are complete.
-	// The atomic counter goes 0 → 1 → 2 and the goroutine that reaches
-	// 2 drives the transition. See dklstss/keygen_party.go for the
-	// rationale (H-3 equivocation defense).
+	// as a unicast; the echo phase cannot run until both halves are
+	// complete. The atomic counter goes 0 → 1 → 2 and the goroutine
+	// that reaches 2 drives the transition. See dklstss/keygen_party.go
+	// for the rationale (H-3 equivocation defense + echo-broadcast).
 	r1JoinCount atomic.Int32
 	r1Bcasts    []*refreshR1Bcast
 	r1Unicasts  []*refreshR1Unicast
 	r1OtherIds  []*tss.PartyID
+
+	// Echo phase: see keygen_party.go.
+	r1Echoes []*echoMsg
 
 	Done chan *Key
 	Err  chan error
@@ -165,18 +168,65 @@ func (rp *RefreshParty) round1() error {
 }
 
 // onR1Bcast / onR1Unicast: see keygen_party.go for the join semantics.
+// The second to complete fires the echo phase, not round2.
 func (rp *RefreshParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*refreshR1Bcast) {
 	rp.r1Bcasts = msgs
 	if rp.r1JoinCount.Add(1) == 2 {
-		rp.round2(otherIds)
+		rp.startEchoPhase(otherIds)
 	}
 }
 
 func (rp *RefreshParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*refreshR1Unicast) {
 	rp.r1Unicasts = msgs
 	if rp.r1JoinCount.Add(1) == 2 {
-		rp.round2(otherIds)
+		rp.startEchoPhase(otherIds)
 	}
+}
+
+// startEchoPhase: see keygen_party.go.
+func (rp *RefreshParty) startEchoPhase(otherIds []*tss.PartyID) {
+	if err := rp.ctx.Err(); err != nil {
+		rp.Err <- err
+		return
+	}
+	digests := make(map[string][]byte, len(otherIds))
+	for n, pid := range otherIds {
+		digests[peerKeyStr(pid)] = commitDigest(echoTagRefresh, pid, rp.r1Bcasts[n].VSSCommitments)
+	}
+
+	Pi := rp.params.PartyID()
+	out := &echoMsg{Digests: digests}
+	m := tss.JsonWrap(refreshTypeEcho, out, Pi, nil)
+	if err := rp.params.Broker().Receive(m); err != nil {
+		rp.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](refreshTypeEcho, otherIds, rp.onEcho)
+	rp.params.Broker().Connect(refreshTypeEcho, rcv)
+}
+
+// onEcho: see keygen_party.go.
+func (rp *RefreshParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
+	if err := rp.ctx.Err(); err != nil {
+		rp.Err <- err
+		return
+	}
+	Pi := rp.params.PartyID()
+	selfKey := peerKeyStr(Pi)
+
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	myDigests[selfKey] = commitDigest(echoTagRefresh, Pi, flattenPointXY(rp.vsSelf))
+	for n, pid := range otherIds {
+		myDigests[peerKeyStr(pid)] = commitDigest(echoTagRefresh, pid, rp.r1Bcasts[n].VSSCommitments)
+	}
+
+	all := append([]*tss.PartyID{Pi}, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, otherIds, msgs, all, echoSourceRefresh); err != nil {
+		rp.Err <- err
+		return
+	}
+	rp.r1Echoes = msgs
+	rp.round2(otherIds)
 }
 
 func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
@@ -430,7 +480,11 @@ type refreshR1Unicast struct {
 const (
 	refreshTypeR1Bcast   = "dkls:refresh:r1bc"
 	refreshTypeR1Unicast = "dkls:refresh:r1uc"
+	refreshTypeEcho      = "dkls:refresh:echo"
 	refreshTypeR2        = "dkls:refresh:r2"
+
+	echoTagRefresh    = "DKLS23-echo-refresh-v1"
+	echoSourceRefresh = "dklstss-refresh"
 )
 
 func refreshSession(params *tss.Parameters, key *Key) []byte {

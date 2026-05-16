@@ -48,13 +48,22 @@ type KeygenParty struct {
 	// Round-1 join state. The VSS commitments arrive as a broadcast
 	// (one per dealer, identical bytes to every recipient) and the
 	// share + OT-base-sender material arrives as a unicast (different
-	// per recipient). round2 cannot run until BOTH halves are complete;
-	// r1JoinCount goes 0 → 1 → 2 and the goroutine that increments to 2
-	// drives the transition.
+	// per recipient). The echo phase cannot run until BOTH halves are
+	// complete; r1JoinCount goes 0 → 1 → 2 and the goroutine that
+	// increments to 2 drives the transition.
 	r1JoinCount atomic.Int32
 	r1Bcasts    []*keygenR1Bcast
 	r1Unicasts  []*keygenR1Unicast
 	r1OtherIds  []*tss.PartyID
+
+	// Echo phase: each recipient broadcasts H(received V_D) for every
+	// dealer D ≠ self; once N-1 echoes arrive we cross-check against
+	// the local view. This catches a peer-code equivocation that the
+	// broker contract alone cannot detect (a malicious dealer running
+	// modified library code that hands the broker different bytes per
+	// recipient under To==nil). See echo.go for the digest format and
+	// culprit-attribution policy.
+	r1Echoes []*echoMsg
 
 	Done chan *Key
 	Err  chan error
@@ -173,11 +182,11 @@ func (kg *KeygenParty) round1() error {
 
 // onR1Bcast collects the broadcast half of round 1 (VSS commitments).
 // It and onR1Unicast race for the second-to-complete spot; the winner
-// fires round2.
+// fires the echo phase.
 func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast) {
 	kg.r1Bcasts = msgs
 	if kg.r1JoinCount.Add(1) == 2 {
-		kg.round2(otherIds)
+		kg.startEchoPhase(otherIds)
 	}
 }
 
@@ -186,8 +195,62 @@ func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast)
 func (kg *KeygenParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*keygenR1Unicast) {
 	kg.r1Unicasts = msgs
 	if kg.r1JoinCount.Add(1) == 2 {
-		kg.round2(otherIds)
+		kg.startEchoPhase(otherIds)
 	}
+}
+
+// startEchoPhase computes this party's digest of every other dealer's
+// VSS commitments, broadcasts the map, and waits for echoes from
+// every other party. See echo.go for the rationale.
+func (kg *KeygenParty) startEchoPhase(otherIds []*tss.PartyID) {
+	if err := kg.ctx.Err(); err != nil {
+		kg.Err <- err
+		return
+	}
+	digests := make(map[string][]byte, len(otherIds))
+	for n, pid := range otherIds {
+		digests[peerKeyStr(pid)] = commitDigest(echoTagKeygen, pid, kg.r1Bcasts[n].VSSCommitments)
+	}
+
+	Pi := kg.params.PartyID()
+	out := &echoMsg{Digests: digests}
+	m := tss.JsonWrap(keygenTypeEcho, out, Pi, nil)
+	if err := kg.params.Broker().Receive(m); err != nil {
+		kg.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](keygenTypeEcho, otherIds, kg.onEcho)
+	kg.params.Broker().Connect(keygenTypeEcho, rcv)
+}
+
+// onEcho cross-checks every received echo against the local view of
+// each dealer's commitments. On consistency, fires round2. On any
+// digest mismatch, surfaces a *tss.Error identifying the equivocating
+// dealer (or the lying echoer when the disagreement is over my own
+// commitments).
+func (kg *KeygenParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
+	if err := kg.ctx.Err(); err != nil {
+		kg.Err <- err
+		return
+	}
+	Pi := kg.params.PartyID()
+	selfKey := peerKeyStr(Pi)
+
+	// Build my view: my canonical V for self, plus my received V for
+	// every other dealer.
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	myDigests[selfKey] = commitDigest(echoTagKeygen, Pi, flattenPointXY(kg.vs))
+	for n, pid := range otherIds {
+		myDigests[peerKeyStr(pid)] = commitDigest(echoTagKeygen, pid, kg.r1Bcasts[n].VSSCommitments)
+	}
+
+	all := append([]*tss.PartyID{Pi}, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, otherIds, msgs, all, echoSourceKeygen); err != nil {
+		kg.Err <- err
+		return
+	}
+	kg.r1Echoes = msgs
+	kg.round2(otherIds)
 }
 
 func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
@@ -417,7 +480,11 @@ type keygenR2 struct {
 const (
 	keygenTypeR1Bcast   = "dkls:keygen:r1bc"
 	keygenTypeR1Unicast = "dkls:keygen:r1uc"
+	keygenTypeEcho      = "dkls:keygen:echo"
 	keygenTypeR2        = "dkls:keygen:r2"
+
+	echoTagKeygen    = "DKLS23-echo-keygen-v1"
+	echoSourceKeygen = "dklstss-keygen"
 )
 
 // --- helpers --------------------------------------------------------

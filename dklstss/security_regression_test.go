@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/vss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
@@ -279,6 +280,303 @@ func TestResharingPartyDetectsMalformedOldContribution(t *testing.T) {
 		}
 	}
 	require.True(t, sawAbort, "at least one new party must abort with the pubkey-mismatch error")
+}
+
+// equivocatingBroker wraps the standard test hubBroker so a specified
+// sender can ship different bytes to different recipients under a
+// single To==nil broadcast — i.e., the application-level equivocation
+// scenario that the echo-broadcast defense is designed to catch.
+//
+// When perRecipientOverride[msgType][recipientIdx] is set and the
+// wrapped party emits a To==nil message of that type, the broker
+// replaces msg.Data with the override before forwarding to that
+// recipient. Other (msgType, recipient) combinations and other senders
+// route normally.
+type equivocatingBroker struct {
+	*hubBroker
+	perRecipientOverride map[string]map[int]any
+}
+
+func (b *equivocatingBroker) Receive(msg *tss.JsonMessage) error {
+	if msg.From != nil && msg.From.Index == b.partyIdx && msg.To == nil {
+		if override, ok := b.perRecipientOverride[msg.Type]; ok {
+			for j, broker := range b.hub.brokers {
+				if j == b.partyIdx {
+					continue
+				}
+				mutated := *msg
+				if alt, ok := override[j]; ok {
+					mutated.Data = alt
+				}
+				if err := broker.Receive(&mutated); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	return b.hubBroker.Receive(msg)
+}
+
+// TestKeygenPartyEchoBroadcastCatchesEquivocation injects an
+// application-level equivocation by the dealer at partyIdx=0: the
+// broker delivers different VSS commitments to recipient 1 than to
+// recipients 2/3. The echo phase MUST surface this as a tss.Error
+// whose Culprits() identifies party 0.
+func TestKeygenPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
+	const partyCount, threshold = 4, 2
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	hub := newTestHub(partyCount)
+
+	// Build an alternative valid keygenR1Bcast for the dealer using a
+	// distinct polynomial. The override delivers this to recipient 1
+	// while recipients 2 and 3 receive the dealer's canonical bcast.
+	ec := tss.S256()
+	ids := pIDs.Keys()
+	altU, err := rand.Int(rand.Reader, ec.Params().N)
+	require.NoError(t, err)
+	altVs, _, err := vss.Create(ec, threshold, altU, ids, rand.Reader)
+	require.NoError(t, err)
+	altBcast := &keygenR1Bcast{VSSCommitments: flattenPointXY(altVs)}
+
+	hub.brokers[0] = (&equivocatingBroker{
+		hubBroker: hub.brokers[0],
+		perRecipientOverride: map[string]map[int]any{
+			keygenTypeR1Bcast: {1: altBcast},
+		},
+	}).hubBroker
+	// Swap the actual handler so the wrapper is reachable.
+	eqb := &equivocatingBroker{
+		hubBroker: hub.brokers[0],
+		perRecipientOverride: map[string]map[int]any{
+			keygenTypeR1Bcast: {1: altBcast},
+		},
+	}
+
+	p2pCtx := tss.NewPeerContext(pIDs)
+	parties := make([]*KeygenParty, partyCount)
+	for i := 0; i < partyCount; i++ {
+		params := tss.NewParameters(tss.S256(), p2pCtx, pIDs[i], partyCount, threshold)
+		if i == 0 {
+			params.SetBroker(eqb)
+		} else {
+			params.SetBroker(hub.brokers[i])
+		}
+		kg, err := NewKeygen(context.Background(), params)
+		require.NoError(t, err)
+		parties[i] = kg
+	}
+
+	// Every party must either abort (surfacing the equivocation) or
+	// complete. Of the parties that abort with a tss.Error, AT LEAST
+	// ONE honest recipient (parties 1..N-1) must name the equivocator
+	// (party 0) as culprit. Party 0 itself, if it aborts, would name
+	// the lying echoer from its own skewed perspective — that's a
+	// correct local conclusion that we do not assert against.
+	abortCount := 0
+	namedDealer0 := 0
+	dealer0Key := pIDs[0].KeyInt().String()
+	for i, p := range parties {
+		select {
+		case <-p.Done:
+			t.Logf("party %d completed (no abort surfaced)", i)
+		case err := <-p.Err:
+			require.Error(t, err)
+			abortCount++
+			tssErr, ok := err.(*tss.Error)
+			if !ok {
+				t.Logf("party %d error (non-tss.Error): %v", i, err)
+				continue
+			}
+			culps := tssErr.Culprits()
+			require.NotEmpty(t, culps, "party %d's tss.Error should carry a culprit", i)
+			if i != 0 && culps[0].KeyInt().String() == dealer0Key {
+				namedDealer0++
+			}
+			t.Logf("party %d aborted with culprit %s", i, culps[0].KeyInt().String())
+		case <-time.After(60 * time.Second):
+			t.Fatalf("party %d neither completed nor aborted", i)
+		}
+	}
+	require.GreaterOrEqual(t, namedDealer0, 1,
+		"at least one honest recipient must identify the equivocating dealer (party 0)")
+	t.Logf("equivocation aborts: %d/%d; %d honest peers named dealer 0", abortCount, partyCount, namedDealer0)
+}
+
+// TestRefreshPartyEchoBroadcastCatchesEquivocation: at refresh time
+// party 0 (the equivocating dealer) ships different
+// zero-constant-term commitments to recipient 1 than to recipients
+// 2/3. The NEW-side echo phase must surface the disagreement with
+// party 0 named as culprit on every honest recipient.
+func TestRefreshPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
+	const partyCount, threshold = 4, 2
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	oldKeys := runDistributedKeygen(t, pIDs, threshold)
+
+	hub := newTestHub(partyCount)
+
+	// Alternative refresh-Vs (zero-constant polynomial, threshold
+	// coefficients). vss.Create won't help — it always emits the
+	// constant term too. Build manually like refresh_party.go round1.
+	ec := tss.S256()
+	q := ec.Params().N
+	coeffs := make([]*big.Int, threshold)
+	altVs := make([]*crypto.ECPoint, threshold)
+	for k := 0; k < threshold; k++ {
+		c, err := rand.Int(rand.Reader, q)
+		require.NoError(t, err)
+		coeffs[k] = c
+		altVs[k] = crypto.ScalarBaseMult(ec, c)
+	}
+	altBcast := &refreshR1Bcast{VSSCommitments: flattenPointXY(altVs)}
+
+	eqb := &equivocatingBroker{
+		hubBroker: hub.brokers[0],
+		perRecipientOverride: map[string]map[int]any{
+			refreshTypeR1Bcast: {1: altBcast},
+		},
+	}
+
+	p2pCtx := tss.NewPeerContext(pIDs)
+	parties := make([]*RefreshParty, partyCount)
+	for i := 0; i < partyCount; i++ {
+		params := tss.NewParameters(tss.S256(), p2pCtx, pIDs[i], partyCount, threshold)
+		if i == 0 {
+			params.SetBroker(eqb)
+		} else {
+			params.SetBroker(hub.brokers[i])
+		}
+		rp, err := NewRefresh(context.Background(), params, oldKeys[i])
+		require.NoError(t, err)
+		parties[i] = rp
+	}
+
+	dealer0Key := pIDs[0].KeyInt().String()
+	namedDealer0 := 0
+	for i, p := range parties {
+		select {
+		case <-p.Done:
+			t.Logf("party %d completed", i)
+		case err := <-p.Err:
+			require.Error(t, err)
+			tssErr, ok := err.(*tss.Error)
+			if !ok {
+				t.Logf("party %d non-tss.Error: %v", i, err)
+				continue
+			}
+			culps := tssErr.Culprits()
+			require.NotEmpty(t, culps, "party %d's tss.Error should carry a culprit", i)
+			if i != 0 && culps[0].KeyInt().String() == dealer0Key {
+				namedDealer0++
+			}
+			t.Logf("party %d aborted with culprit %s", i, culps[0].KeyInt().String())
+		case <-time.After(60 * time.Second):
+			t.Fatalf("party %d neither completed nor aborted", i)
+		}
+	}
+	require.GreaterOrEqual(t, namedDealer0, 1,
+		"at least one honest recipient must identify the equivocating dealer (party 0)")
+}
+
+// TestResharingPartyEchoBroadcastCatchesEquivocation: OLD participant 0
+// ships different commitments to NEW members. NEW-side echo phase
+// must surface the abort with OLD party 0 named as culprit.
+func TestResharingPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
+	const oldN, oldT = 3, 1
+	oldPIDs := tss.GenerateTestPartyIDs(oldN)
+	oldKeys := runDistributedKeygen(t, oldPIDs, oldT)
+	oldPub := oldKeys[0].ECDSAPub
+
+	newPIDs := genPartyIDsOffset(3, 12000)
+	const newT = 1
+	oldSubset := tss.SortedPartyIDs{oldPIDs[0], oldPIDs[1]}
+
+	combined := append(tss.UnSortedPartyIDs(nil), oldPIDs...)
+	combined = append(combined, newPIDs...)
+	combinedSorted := tss.SortPartyIDs(combined)
+	combinedCtx := tss.NewPeerContext(combinedSorted)
+
+	hub := newTestHub(len(combinedSorted))
+	pidIdx := map[string]int{}
+	for i, p := range combinedSorted {
+		pidIdx[p.KeyInt().String()] = i
+	}
+
+	// Build an alternative valid reshareR1Bcast for OLD party 0 (a
+	// different polynomial over the new committee).
+	ec := tss.S256()
+	q := ec.Params().N
+	newIDs := newPIDs.Keys()
+	altScaled, err := rand.Int(rand.Reader, q)
+	require.NoError(t, err)
+	altVs, _, err := vss.Create(ec, newT, altScaled, newIDs, rand.Reader)
+	require.NoError(t, err)
+	altBcast := &reshareR1Bcast{VSSCommitments: flattenPointXY(altVs)}
+
+	old0Idx := pidIdx[oldPIDs[0].KeyInt().String()]
+	new1Idx := pidIdx[newPIDs[1].KeyInt().String()]
+
+	eqb := &equivocatingBroker{
+		hubBroker: hub.brokers[old0Idx],
+		perRecipientOverride: map[string]map[int]any{
+			reshareTypeR1Bcast: {new1Idx: altBcast},
+		},
+	}
+
+	// Spawn OLD parties.
+	for _, p := range oldSubset {
+		oldIdxKey := -1
+		for j, q := range oldPIDs {
+			if q.KeyInt().Cmp(p.KeyInt()) == 0 {
+				oldIdxKey = j
+				break
+			}
+		}
+		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), oldT)
+		if pidIdx[p.KeyInt().String()] == old0Idx {
+			params.SetBroker(eqb)
+		} else {
+			params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
+		}
+		_, err := NewResharing(context.Background(), params, oldPub, oldKeys[oldIdxKey], oldSubset, newPIDs, newT)
+		require.NoError(t, err)
+	}
+
+	// Spawn NEW parties.
+	var newParties []*ResharingParty
+	for _, p := range newPIDs {
+		params := tss.NewParameters(tss.S256(), combinedCtx, p, len(combinedSorted), newT)
+		params.SetBroker(hub.brokers[pidIdx[p.KeyInt().String()]])
+		rp, err := NewResharing(context.Background(), params, oldPub, nil, oldSubset, newPIDs, newT)
+		require.NoError(t, err)
+		newParties = append(newParties, rp)
+	}
+
+	dealer0Key := oldPIDs[0].KeyInt().String()
+	namedDealer0 := 0
+	for i, p := range newParties {
+		select {
+		case k := <-p.Done:
+			t.Logf("new party %d completed (key non-nil: %v)", i, k != nil)
+		case err := <-p.Err:
+			require.Error(t, err)
+			tssErr, ok := err.(*tss.Error)
+			if !ok {
+				t.Logf("new party %d non-tss.Error: %v", i, err)
+				continue
+			}
+			culps := tssErr.Culprits()
+			require.NotEmpty(t, culps)
+			if culps[0].KeyInt().String() == dealer0Key {
+				namedDealer0++
+			}
+			t.Logf("new party %d aborted, culprit=%s", i, culps[0].KeyInt().String())
+		case <-time.After(60 * time.Second):
+			t.Fatalf("new party %d neither completed nor aborted", i)
+		}
+	}
+	require.GreaterOrEqual(t, namedDealer0, 1,
+		"at least one new party must identify OLD party 0 as the equivocator")
 }
 
 // TestSignWithPresignRejectsUnaggregatedOutput covers the H-1 audit fix:

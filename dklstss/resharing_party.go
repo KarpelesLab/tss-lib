@@ -76,13 +76,27 @@ type ResharingParty struct {
 	// Round-1 join state on the NEW side. OLD participants now ship
 	// their VSS commitments as a To==nil broadcast (so equivocation
 	// is closed at the broker layer) and the per-recipient share as a
-	// unicast. afterRound1 cannot run until both halves arrive from
+	// unicast. The echo phase cannot run until both halves arrive from
 	// every OLD participant; the atomic counter goes 0 → 1 → 2 and the
-	// goroutine that reaches 2 fires the rest of the protocol.
+	// goroutine that reaches 2 fires the echo phase.
 	r1JoinCount atomic.Int32
 	r1Bcasts    []*reshareR1Bcast
 	r1Unicasts  []*reshareR1Unicast
 	r1OldIds    []*tss.PartyID
+
+	// Echo phase: every NEW-side party broadcasts H(V_D) digests for
+	// each OLD dealer D to every other NEW-side party. A digest
+	// mismatch identifies the equivocating OLD dealer (see echo.go).
+	// OLD-only parties skip this phase entirely.
+	r1Echoes []*echoMsg
+
+	// oldVs holds this party's own VSS commitments (computed in
+	// oldRound1). Used during the NEW-side echo verification when the
+	// party is OLD+NEW hybrid: the verifier needs a canonical view of
+	// its own commitments to attribute disagreement to a lying echoer
+	// rather than to a (self-)equivocating dealer. Nil for NEW-only
+	// parties.
+	oldVs []*crypto.ECPoint
 
 	Done chan *Key
 	Err  chan error
@@ -271,6 +285,7 @@ func (rp *ResharingParty) oldRound1() error {
 		return fmt.Errorf("vss.Create: %w", err)
 	}
 	encVs := flattenPointXY(Vs)
+	rp.oldVs = Vs
 
 	// BROADCAST: Vs commitments. Identical bytes for every recipient,
 	// sent via To==nil so the broker contract gives the NEW committee
@@ -299,19 +314,100 @@ func (rp *ResharingParty) oldRound1() error {
 }
 
 // onR1Bcast / onR1Unicast: NEW-side join of round 1. See keygen_party.go
-// for the broker-contract rationale.
+// for the broker-contract rationale. The second-to-complete callback
+// fires the echo phase, which gates afterRound1 on a cryptographic
+// agreement among NEW-side parties about every OLD dealer's
+// commitments.
 func (rp *ResharingParty) onR1Bcast(oldIds []*tss.PartyID, msgs []*reshareR1Bcast) {
 	rp.r1Bcasts = msgs
 	if rp.r1JoinCount.Add(1) == 2 {
-		rp.afterRound1(oldIds)
+		rp.startEchoPhase(oldIds)
 	}
 }
 
 func (rp *ResharingParty) onR1Unicast(oldIds []*tss.PartyID, msgs []*reshareR1Unicast) {
 	rp.r1Unicasts = msgs
 	if rp.r1JoinCount.Add(1) == 2 {
-		rp.afterRound1(oldIds)
+		rp.startEchoPhase(oldIds)
 	}
+}
+
+// startEchoPhase: every NEW-side party broadcasts digests of every OLD
+// dealer's commitments to every OTHER NEW-side party. See
+// keygen_party.go for the rationale; the reshare variant differs in
+// that dealers (OLD) and echoers (NEW) are not the same set.
+//
+// OLD-only parties never reach this method — they finish after
+// oldRound1.
+func (rp *ResharingParty) startEchoPhase(oldIds []*tss.PartyID) {
+	if err := rp.ctx.Err(); err != nil {
+		rp.Err <- err
+		return
+	}
+	Pi := rp.params.PartyID()
+	selfKey := peerKeyStr(Pi)
+
+	digests := make(map[string][]byte, len(oldIds))
+	for n, dealer := range oldIds {
+		dealerKey := peerKeyStr(dealer)
+		if dealerKey == selfKey {
+			// OLD+NEW hybrid: don't echo about my own commitments.
+			// Other echoers carry the relevant cross-check for me.
+			continue
+		}
+		digests[dealerKey] = commitDigest(echoTagReshare, dealer, rp.r1Bcasts[n].VSSCommitments)
+	}
+
+	newOthers := make([]*tss.PartyID, 0, len(rp.newSubset)-1)
+	for _, p := range rp.newSubset {
+		if p.KeyInt().Cmp(Pi.KeyInt()) != 0 {
+			newOthers = append(newOthers, p)
+		}
+	}
+
+	out := &echoMsg{Digests: digests}
+	m := tss.JsonWrap(reshareTypeEcho, out, Pi, nil)
+	if err := rp.params.Broker().Receive(m); err != nil {
+		rp.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](reshareTypeEcho, newOthers, func(eids []*tss.PartyID, msgs []*echoMsg) {
+		rp.onEcho(oldIds, eids, msgs)
+	})
+	rp.params.Broker().Connect(reshareTypeEcho, rcv)
+}
+
+// onEcho cross-checks NEW-side echoes against the local view of each
+// OLD dealer's commitments. On consistency, fires afterRound1.
+func (rp *ResharingParty) onEcho(oldIds []*tss.PartyID, echoers []*tss.PartyID, msgs []*echoMsg) {
+	if err := rp.ctx.Err(); err != nil {
+		rp.Err <- err
+		return
+	}
+	Pi := rp.params.PartyID()
+	selfKey := peerKeyStr(Pi)
+
+	myDigests := make(map[string][]byte, len(oldIds))
+	for n, dealer := range oldIds {
+		dealerKey := peerKeyStr(dealer)
+		if dealerKey == selfKey {
+			// OLD+NEW hybrid: canonical view of own commitments, used
+			// to attribute disagreement to a lying echoer rather than
+			// to a (self-)equivocating dealer.
+			if rp.oldVs != nil {
+				myDigests[selfKey] = commitDigest(echoTagReshare, dealer, flattenPointXY(rp.oldVs))
+			}
+			continue
+		}
+		myDigests[dealerKey] = commitDigest(echoTagReshare, dealer, rp.r1Bcasts[n].VSSCommitments)
+	}
+
+	if err := verifyEchoes(myDigests, selfKey, echoers, msgs, oldIds, echoSourceReshare); err != nil {
+		rp.Err <- err
+		return
+	}
+	rp.r1Echoes = msgs
+	rp.afterRound1(oldIds)
 }
 
 // afterRound1 fires on the NEW side once shares from every old subset
@@ -598,8 +694,12 @@ type reshareR2 struct {
 const (
 	reshareTypeR1Bcast   = "dkls:reshare:r1bc" // OLD → NEW (broadcast): Vs
 	reshareTypeR1Unicast = "dkls:reshare:r1uc" // OLD → NEW (unicast): share
+	reshareTypeEcho      = "dkls:reshare:echo" // NEW → NEW (broadcast): commitment digests
 	reshareTypeR2        = "dkls:reshare:r2"   // NEW → NEW: base-OT-Sender
 	reshareTypeR3        = "dkls:reshare:r3"   // NEW → NEW: base-OT-Receiver-R
+
+	echoTagReshare    = "DKLS23-echo-reshare-v1"
+	echoSourceReshare = "dklstss-reshare"
 )
 
 func resharingSession(params *tss.Parameters, oldECDSAPub *crypto.ECPoint, oldSubset, newSubset tss.SortedPartyIDs, newThreshold int) []byte {
