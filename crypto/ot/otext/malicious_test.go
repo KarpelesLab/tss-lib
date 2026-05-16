@@ -110,8 +110,8 @@ func TestCheckRejectsInconsistentChoiceAcrossRows(t *testing.T) {
 	t0 := make([][]byte, Kappa)
 	t1 := make([][]byte, Kappa)
 	for j := 0; j < Kappa; j++ {
-		t0[j] = prgExpand(extReceiver.seeds0[j], lb)
-		t1[j] = prgExpand(extReceiver.seeds1[j], lb)
+		t0[j] = prgExpand(extReceiver.seeds0[j], sid, lb)
+		t1[j] = prgExpand(extReceiver.seeds1[j], sid, lb)
 	}
 	u := make([][]byte, Kappa)
 	for j := 0; j < Kappa; j++ {

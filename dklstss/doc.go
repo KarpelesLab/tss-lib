@@ -66,6 +66,15 @@
 //     check failures as tss.Error with Culprits populated; in plain Sign,
 //     a malicious party's wrong shares are caught one layer up by ECDSA
 //     signature verification.
+//   - OT-extension reuse: the long-term OT extension setup established
+//     at DKG time is reused across many signing/presigning sessions.
+//     The PRG derivation in crypto/ot/otext binds every Extend
+//     invocation to its caller-supplied sid, and signing_party.go /
+//     presign_party.go mix every signer's freshly-random K_i into the
+//     round-2 sid before any ΠMul runs — so re-running the same
+//     protocol with identical static inputs (same key, same subset,
+//     same message) cannot produce identical OT-extension sids between
+//     calls.
 //   - Pre-sign single-use is enforced in two layers: an in-memory atomic
 //     CAS on PresignOutput, and an optional UsedPresignStore interface
 //     for caller-provided durable nonce-commitment tracking across

@@ -91,7 +91,11 @@ func deriveChallenges(sid []byte, u [][]byte, l int) [][]byte {
 	copy(seed[:], hh.Sum(nil))
 
 	lb := l / 8
-	expand := prgExpand(seed, Sigma*lb)
+	// Tagged with a literal "challenges" label so this expansion is
+	// domain-separated from the t0/t1 expansions in Extend below — both
+	// take the same sid but a different seed (the FS coin-seed vs the
+	// base-OT seeds), and the tag makes the separation explicit.
+	expand := prgExpand(seed, []byte("DKLS23-otext-challenges-v1"), Sigma*lb)
 	chi := make([][]byte, Sigma)
 	for h := 0; h < Sigma; h++ {
 		chi[h] = expand[h*lb : (h+1)*lb]
@@ -117,12 +121,17 @@ func (r *ExtReceiver) Extend(sid []byte, c []byte, l int) (*ExtendMsg1, [][KeyLe
 	}
 	lb := l / 8
 
-	// Expand each seed pair to an L-bit PRG output.
+	// Expand each seed pair to an L-bit PRG output. The sid argument
+	// keys the per-call PRG derivation so that two Extend invocations
+	// against the SAME (seeds0, seeds1) but different sid produce
+	// independent t0/t1 — without this, the wire message
+	// u_j = t0[j] ⊕ t1[j] ⊕ c would reuse the t0⊕t1 mask across calls
+	// and leak the XOR of the receiver's choice bits to the sender.
 	t0 := make([][]byte, Kappa)
 	t1 := make([][]byte, Kappa)
 	for j := 0; j < Kappa; j++ {
-		t0[j] = prgExpand(r.seeds0[j], lb)
-		t1[j] = prgExpand(r.seeds1[j], lb)
+		t0[j] = prgExpand(r.seeds0[j], sid, lb)
+		t1[j] = prgExpand(r.seeds1[j], sid, lb)
 	}
 
 	// For each j: u_j = t_{j,0} XOR t_{j,1} XOR c (truncated to L bits).
@@ -209,11 +218,14 @@ func (s *ExtSender) Extend(sid []byte, msg *ExtendMsg1) (m0, m1 [][KeyLen]byte, 
 		}
 	}
 
-	// For each j: q_j = PRG(seed_{j,Δ_j}) XOR (Δ_j · u_j).
+	// For each j: q_j = PRG(seed_{j,Δ_j}, sid) XOR (Δ_j · u_j). The sid
+	// must match the value the receiver passed to its own prgExpand so
+	// the sender's expansion lines up with t_{Δ_j}[j]; this is the
+	// per-call PRG keying that prevents seed reuse across Extend calls.
 	q := make([][]byte, Kappa)
 	for j := 0; j < Kappa; j++ {
 		deltaBit := (s.delta[j/8] >> (uint(j) & 7)) & 1
-		expansion := prgExpand(s.seeds[j], lb)
+		expansion := prgExpand(s.seeds[j], sid, lb)
 		if deltaBit == 1 {
 			q[j] = make([]byte, lb)
 			for b := 0; b < lb; b++ {

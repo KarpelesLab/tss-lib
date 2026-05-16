@@ -117,3 +117,33 @@ func TestPresignPartyEndToEnd(t *testing.T) {
 	assert.True(t, ecdsa.Verify(pub, msg[:], outs[0].r, s),
 		"presigned parts compose to a valid ECDSA signature")
 }
+
+// TestPresignPartyRepeatedReusesOTSafely runs two distributed presigns
+// against the same key + same signer subset. presignSession is fully
+// determined by (pub, subset) so without the round-2 K_i mix the two
+// calls would produce identical ΠMul sids and reuse the long-term OT
+// extension state with matching (seed, sid) — exactly the precondition
+// that pre-fix leaked the choice-bit XOR via the wire `u` rows. The
+// mix folds every signer's K_i into the round-2 ssid, making the
+// effective sid freshly random per call; both presigns must complete
+// and produce distinct R values.
+func TestPresignPartyRepeatedReusesOTSafely(t *testing.T) {
+	const partyCount, threshold = 3, 1
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	keys := runDistributedKeygen(t, pIDs, threshold)
+	signerIdx := []int{0, 2}
+
+	out1 := runDistributedPresign(t, keys, pIDs, signerIdx)
+	out2 := runDistributedPresign(t, keys, pIDs, signerIdx)
+	require.Len(t, out1, len(signerIdx))
+	require.Len(t, out2, len(signerIdx))
+
+	// Each signer's locally-held R must agree within one call but
+	// differ between calls — fresh nonces per presign.
+	for i := 1; i < len(out1); i++ {
+		assert.Truef(t, out1[0].R.Equals(out1[i].R), "first-run R differs at signer %d", i)
+		assert.Truef(t, out2[0].R.Equals(out2[i].R), "second-run R differs at signer %d", i)
+	}
+	assert.Falsef(t, out1[0].R.Equals(out2[0].R),
+		"two presigns should produce distinct group nonce R (fresh k_i per call)")
+}

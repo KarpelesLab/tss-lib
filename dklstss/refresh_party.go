@@ -386,6 +386,14 @@ const (
 )
 
 func refreshSession(params *tss.Parameters, key *Key) []byte {
+	// Bound to (pub, party set). The base-OT setup that follows each
+	// refresh uses pairBaseSid(ssid, ...) for the per-pair sids; even if
+	// two refreshes produce the same ssid (same key + parties), the base
+	// OT messages are randomized internally (fresh y, delta, x_i per
+	// call) and the derived OT-extension seeds are independent across
+	// refreshes — so sid collision here does not break security. Refresh
+	// also does NOT run signing-time ΠMul, so the per-call PRG sid
+	// binding in crypto/ot/otext is not exercised at refresh time.
 	h := sha256.New()
 	h.Write([]byte("DKLS23-refresh-party-v1-"))
 	h.Write(key.ECDSAPub.X().Bytes())

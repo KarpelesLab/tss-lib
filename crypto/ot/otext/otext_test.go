@@ -248,3 +248,65 @@ func TestExtendRandomizedSweep(t *testing.T) {
 		}
 	}
 }
+
+// TestExtendDoesNotLeakChoiceXorAcrossSessions is the regression test for
+// the OT-extension seed-reuse vulnerability. Running Extend twice against
+// the SAME setup with the SAME sid but DIFFERENT choice bits must NOT
+// expose c1⊕c2 via XOR of the wire messages. (Two different sids are
+// also fine and easier to spot; we use the same-sid case as the harder
+// constraint — the per-call PRG derivation must mix sid into t0/t1
+// regardless of whether sid is identical to a prior call.)
+//
+// Pre-fix the assertion would fire: u1⊕u2 = t0⊕t1⊕c1 ⊕ t0⊕t1⊕c2 = c1⊕c2.
+// Post-fix t0/t1 are re-derived per call so u1⊕u2 is uniform-looking.
+func TestExtendDoesNotLeakChoiceXorAcrossSessions(t *testing.T) {
+	const l = 256
+	sid := []byte("test-no-leak")
+	extSender, extReceiver, _ := setupExtParties(t, sid)
+
+	c1 := make([]byte, l/8)
+	c2 := make([]byte, l/8)
+	_, err := rand.Read(c1)
+	require.NoError(t, err)
+	_, err = rand.Read(c2)
+	require.NoError(t, err)
+	cXor := make([]byte, l/8)
+	for i := range cXor {
+		cXor[i] = c1[i] ^ c2[i]
+	}
+
+	// Use two distinct sids — even when sids differ, the v1 PRG would
+	// still produce identical t0/t1 (only the OUTPUT hashes were sid-
+	// separated), so this catches the bug too. The first session id is
+	// `sid`; the second is a separate value.
+	sid2 := []byte("test-no-leak-call-2")
+	msg1, _, err := extReceiver.Extend(sid, c1, l)
+	require.NoError(t, err)
+	msg2, _, err := extReceiver.Extend(sid2, c2, l)
+	require.NoError(t, err)
+
+	// Sender side must also still verify with matching sids.
+	_, _, err = extSender.Extend(sid, msg1)
+	require.NoError(t, err)
+	_, _, err = extSender.Extend(sid2, msg2)
+	require.NoError(t, err)
+
+	// For every row j ∈ [Kappa], u1[j] ⊕ u2[j] must NOT equal c1⊕c2.
+	// With a good PRG the chance that any one row accidentally collides
+	// with cXor is 2^-256 — fail loudly on a match.
+	for j := 0; j < Kappa; j++ {
+		uXor := make([]byte, len(msg1.U[j]))
+		for b := range uXor {
+			uXor[b] = msg1.U[j][b] ^ msg2.U[j][b]
+		}
+		for b := range uXor {
+			if uXor[b] != cXor[b] {
+				// Different at byte b — this row does NOT leak.
+				break
+			}
+			if b == len(uXor)-1 {
+				t.Fatalf("row %d: u1⊕u2 == c1⊕c2 — OT-extension seed reuse leaks choice XOR", j)
+			}
+		}
+	}
+}

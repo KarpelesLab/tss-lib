@@ -275,11 +275,22 @@ func addMod(q, a, b *big.Int) *big.Int {
 // makeSid composes a per-ΠMul sid bound to the signing session and the
 // (alice, bob, kind) triple. Each invocation produces a distinct sid so
 // the OT extension's challenge derivation is freshly bound.
+//
+// alice and bob are encoded as length-prefixed big-endian 4-byte values
+// rather than raw bytes — the previous `byte(alice), byte(bob)` form
+// truncated indexes silently, so a 256-party setup would collide sids
+// across pairs whose low bytes matched. With 4-byte encoding the
+// encoding is injective up to 2^32 parties, far past any practical TSS.
 func makeSid(ssid []byte, kind string, alice, bob int) []byte {
-	out := make([]byte, 0, len(ssid)+8+len(kind))
+	out := make([]byte, 0, len(ssid)+len(kind)+11)
 	out = append(out, ssid...)
 	out = append(out, '|')
 	out = append(out, kind...)
-	out = append(out, '|', byte(alice), byte(bob))
+	out = append(out, '|')
+	out = append(out,
+		byte(alice>>24), byte(alice>>16), byte(alice>>8), byte(alice),
+		'|',
+		byte(bob>>24), byte(bob>>16), byte(bob>>8), byte(bob),
+	)
 	return out
 }

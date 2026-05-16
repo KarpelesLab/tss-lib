@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -63,8 +64,11 @@ func TestKeyLoadRejectsBadVersion(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, keys[0].Save(&buf))
 
-	// Tamper with version field.
-	bad := bytes.Replace(buf.Bytes(), []byte("\"version\":1"), []byte("\"version\":99"), 1)
+	// Tamper with version field. Save emits the current KeyWireVersion;
+	// rewrite it to an unsupported value (Load accepts the current
+	// version and the legacy v1 only).
+	current := fmt.Sprintf("\"version\":%d", KeyWireVersion)
+	bad := bytes.Replace(buf.Bytes(), []byte(current), []byte("\"version\":99"), 1)
 	_, err = Load(bytes.NewReader(bad))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "version mismatch")
@@ -102,4 +106,34 @@ func TestKeySaveLoadAllPartiesTogether(t *testing.T) {
 		Y:     loaded[0].ECDSAPub.Y(),
 	}
 	assert.True(t, ecdsa.Verify(pub, msg[:], sig.R, sig.S))
+}
+
+// TestKeySaveLoadIdentityMaterial verifies the v2 wire format preserves
+// the Ed25519 long-term identity keys across a Save/Load round-trip and
+// that transcript signing still works against the reloaded key.
+func TestKeySaveLoadIdentityMaterial(t *testing.T) {
+	const n, th = 2, 1
+	priv, pub, err := GenerateIdentityKeys(n, rand.Reader)
+	require.NoError(t, err)
+
+	keys, err := KeygenWithIdentities(n, th, genPartyIDs(n), priv, pub, rand.Reader)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, keys[0].Save(&buf))
+	loaded, err := Load(&buf)
+	require.NoError(t, err)
+
+	assert.Equal(t, []byte(keys[0].IdentityPub), []byte(loaded.IdentityPub), "IdentityPub must round-trip")
+	assert.Equal(t, []byte(keys[0].IdentityPriv), []byte(loaded.IdentityPriv), "IdentityPriv must round-trip")
+	require.Equal(t, n, len(loaded.PeerIdentityPubs), "PeerIdentityPubs length must round-trip")
+	for i := range loaded.PeerIdentityPubs {
+		assert.Equal(t, []byte(keys[0].PeerIdentityPubs[i]), []byte(loaded.PeerIdentityPubs[i]),
+			"PeerIdentityPubs[%d] must round-trip", i)
+	}
+
+	transcript := []byte("round 1 reveal")
+	sig := loaded.SignTranscript(transcript)
+	require.NotNil(t, sig, "loaded key must still sign transcripts")
+	assert.True(t, loaded.VerifyTranscript(0, transcript, sig), "loaded key's transcript signature must verify under own peer pub")
 }

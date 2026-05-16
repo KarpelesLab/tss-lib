@@ -114,10 +114,13 @@ func Reshare(oldKeys []*Key, oldSubsetIdx []int, newPartyIDs tss.SortedPartyIDs,
 		scaled := new(big.Int).Mul(oldLambdas[i], k.Xi)
 		scaled.Mod(scaled, q)
 		if scaled.Sign() == 0 {
-			// Vanishingly unlikely. vss.Create panics on 0 secret;
-			// fall back to a deterministic non-zero offset to keep
-			// the protocol robust.
-			scaled.SetInt64(1)
+			// λ·x mod q == 0 is statistically impossible for honest
+			// random shares (probability ~ 1/q ≈ 2^-256). Treat as a
+			// fatal protocol abort rather than silently substituting a
+			// non-zero scalar — substitution would change the joint
+			// secret by a known amount and the downstream pubkey-equality
+			// check would reject anyway, but with a misleading error.
+			return nil, fmt.Errorf("dklstss: Reshare old participant %d has λ·x_i ≡ 0 mod q (key material likely corrupted)", oldSubsetIdx[i])
 		}
 		Vs, S, err := vss.Create(ec, tNew, scaled, newIDs, rng)
 		if err != nil {

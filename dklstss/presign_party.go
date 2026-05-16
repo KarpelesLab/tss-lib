@@ -193,6 +193,13 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	}
 	pp.r = r
 
+	// Mix every signer's K_i into the effective ssid so the OT-extension
+	// sid varies per presign call — required to keep the per-call PRG
+	// derivation in crypto/ot/otext distinct across reuses of the same
+	// long-term OT-extension setup. presignSession alone binds only to
+	// (pub, subset) which is constant across many presigns.
+	pp.ssid = mixRoundOneSsid(pp.ssid, Pi, pp.K_i, pp.otherSubset, pp.peerK)
+
 	for _, Pj := range pp.otherSubset {
 		alicePair := pp.key.OT[pp.indexInFullCommittee(Pj)]
 		if alicePair == nil {

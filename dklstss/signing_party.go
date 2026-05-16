@@ -242,6 +242,19 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	}
 	sp.r = r
 
+	// Mix every signer's freshly-sampled K_i into the effective ssid for
+	// round 2+. The OT extension state is reused across signings, so the
+	// sid passed to ole.AliceStep1 / ole.BobStep1 (and through to the
+	// per-call PRG derivation in crypto/ot/otext) MUST vary per call.
+	// Without this, two signings of the same hash by the same subset
+	// would produce identical sidK/sidX, the per-call PRG would yield
+	// identical t0/t1 masks, and the receiver's wire message
+	// u_j = t0[j] ⊕ t1[j] ⊕ bitsLE(α) would leak α¹⊕α² across the two
+	// calls. K_i = k_i · G is uniformly random per signing for every
+	// honest signer, so the combined hash is fresh with overwhelming
+	// probability whenever at least one signer is honest.
+	sp.ssid = mixRoundOneSsid(sp.ssid, Pi, sp.K_i, otherIds, sp.peerK)
+
 	// For each peer j, this party plays Alice in two ΠMul instances:
 	// (k_i, ρ_j) and (sx_i, ρ_j). Send Alice envelopes.
 	for _, Pj := range sp.otherSubset {
@@ -495,6 +508,51 @@ func signMulSid(ssid []byte, kind string, alice, bob *big.Int) []byte {
 	h.Write(alice.Bytes())
 	h.Write([]byte{'|'})
 	h.Write(bob.Bytes())
+	return h.Sum(nil)
+}
+
+// mixRoundOneSsid combines the per-call random round-1 contributions
+// (each signer's K_i point) into the static ssid to produce an effective
+// ssid that's freshly random per signing call. Used by SigningParty and
+// PresignParty to make the ΠMul sid passed to the OT-extension layer
+// vary per call, which is required to prevent OT-extension seed reuse
+// from leaking choice bits — see crypto/ot/otext/prg.go for the matching
+// per-call PRG derivation.
+//
+// The hash sorts by party key-int so every honest party computes the
+// same value regardless of message-arrival order.
+func mixRoundOneSsid(baseSsid []byte, selfID *tss.PartyID, selfK *crypto.ECPoint, peerIDs []*tss.PartyID, peerK map[string]*crypto.ECPoint) []byte {
+	type idK struct {
+		id *big.Int
+		k  *crypto.ECPoint
+	}
+	all := make([]idK, 0, len(peerIDs)+1)
+	all = append(all, idK{id: selfID.KeyInt(), k: selfK})
+	for _, pid := range peerIDs {
+		k, ok := peerK[peerKeyStr(pid)]
+		if !ok || k == nil {
+			continue
+		}
+		all = append(all, idK{id: pid.KeyInt(), k: k})
+	}
+	// Sort by id (ascending big-int).
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j-1].id.Cmp(all[j].id) > 0; j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	h := sha256.New()
+	h.Write([]byte("DKLS23-sign-ssid-mix-v1"))
+	h.Write([]byte{'|'})
+	h.Write(baseSsid)
+	for _, e := range all {
+		h.Write([]byte{'|'})
+		h.Write(e.id.Bytes())
+		h.Write([]byte{'|'})
+		h.Write(e.k.X().Bytes())
+		h.Write([]byte{'|'})
+		h.Write(e.k.Y().Bytes())
+	}
 	return h.Sum(nil)
 }
 

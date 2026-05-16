@@ -150,3 +150,61 @@ func TestSigningPartyWithHDTweak(t *testing.T) {
 	}
 	assert.False(t, ecdsa.Verify(parent, msg[:], sig.R, sig.S), "signature must NOT verify under parent")
 }
+
+// TestSigningPartyRepeatedSignReusesOTSafely runs two distributed
+// signings of the SAME message with the SAME subset against a single
+// keygen. Each ΠMul invocation reuses the OT-extension state from
+// keygen, which is the worst case for the OT-extension PRG: signSession
+// alone would have produced identical sids across the two calls. With
+// the per-call ssid mix that folds every K_i into the round-2 sid, the
+// effective sid is freshly random per signing and both signatures
+// verify under the same public key.
+func TestSigningPartyRepeatedSignReusesOTSafely(t *testing.T) {
+	const partyCount, threshold = 3, 1
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	keys := runDistributedKeygen(t, pIDs, threshold)
+
+	subsetIdx := []int{0, 1}
+	subset := tss.SortedPartyIDs{pIDs[subsetIdx[0]], pIDs[subsetIdx[1]]}
+	msg := sha256.Sum256([]byte("same-message-twice"))
+	p2pCtx := tss.NewPeerContext(pIDs)
+
+	runOnce := func() *Signature {
+		hub := newTestHub(partyCount)
+		parties := make([]*SigningParty, len(subset))
+		for n, sIdx := range subsetIdx {
+			params := tss.NewParameters(tss.S256(), p2pCtx, pIDs[sIdx], partyCount, threshold)
+			params.SetBroker(hub.brokers[sIdx])
+			sp, err := NewSigning(context.Background(), params, keys[sIdx], msg[:], subset, nil)
+			require.NoError(t, err)
+			parties[n] = sp
+		}
+		var got *Signature
+		for i, p := range parties {
+			select {
+			case s := <-p.Done:
+				if i == 0 {
+					got = s
+				}
+			case err := <-p.Err:
+				t.Fatalf("signing party %d failed: %v", i, err)
+			case <-time.After(60 * time.Second):
+				t.Fatalf("signing party %d timeout", i)
+			}
+		}
+		return got
+	}
+
+	sig1 := runOnce()
+	sig2 := runOnce()
+
+	pub := &ecdsa.PublicKey{
+		Curve: keys[0].ECDSAPub.Curve(),
+		X:     keys[0].ECDSAPub.X(),
+		Y:     keys[0].ECDSAPub.Y(),
+	}
+	assert.True(t, ecdsa.Verify(pub, msg[:], sig1.R, sig1.S), "first signature must verify")
+	assert.True(t, ecdsa.Verify(pub, msg[:], sig2.R, sig2.S), "second signature must verify")
+	// The two runs use independent nonces; R values should differ.
+	assert.NotEqual(t, sig1.R.String(), sig2.R.String(), "R should be freshly random per signing")
+}

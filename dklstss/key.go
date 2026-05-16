@@ -16,10 +16,15 @@ import (
 // material (the joint public key, every party's commitment) and private
 // material (this party's Shamir share, per-pair OT extension state).
 //
-// A Key is safe to JSON-serialize for persistence; the OT extension
-// state is not exported by default because reuse across crash-restart
-// boundaries requires nonce-counter persistence that this version does
-// not yet implement.
+// A Key is safe to JSON-serialize for persistence: Save (in serialize.go)
+// emits the OT extension setup state alongside the key share, and Load
+// reconstructs both. Re-use across crash-restart is safe because the
+// per-call PRG derivation in crypto/ot/otext binds every Extend
+// invocation to its caller-supplied sid (see crypto/ot/otext/prg.go),
+// and dklstss/signing_party.go mixes each signing's random K_i values
+// into that sid so consecutive signings can never collide on it.
+// Identity material (Ed25519 long-term keys for transcript signing) is
+// also persisted by Save when KeygenWithIdentities was used.
 type Key struct {
 	Curve    elliptic.Curve   `json:"-"`
 	N        int              // total number of parties

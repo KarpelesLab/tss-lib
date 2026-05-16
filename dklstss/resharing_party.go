@@ -206,7 +206,10 @@ func (rp *ResharingParty) oldRound1() error {
 	scaled := new(big.Int).Mul(rp.oldLambda, rp.oldKey.Xi)
 	scaled.Mod(scaled, q)
 	if scaled.Sign() == 0 {
-		scaled.SetInt64(1) // vanishingly unlikely; avoids vss.Create panic
+		// See resharing.go for rationale: probability ~ 1/q. Treat as
+		// fatal rather than silently substituting a non-zero scalar
+		// (which would mint an unrelated public key downstream).
+		return fmt.Errorf("dklstss: oldKey λ·Xi ≡ 0 mod q (key material likely corrupted)")
 	}
 
 	newIDs := make([]*big.Int, len(rp.newSubset))
@@ -505,6 +508,11 @@ const (
 )
 
 func resharingSession(params *tss.Parameters, oldKey *Key, oldSubset, newSubset tss.SortedPartyIDs, newThreshold int) []byte {
+	// As with refreshSession, the resharing protocol only runs base-OT
+	// setup (no signing-time ΠMul), so even if two resharings produce
+	// the same ssid the resulting OT-extension seeds differ due to
+	// fresh internal randomness in base-OT. Encoding newThreshold as
+	// big-endian 4 bytes (was byte()) so values >= 256 cannot collide.
 	h := sha256.New()
 	h.Write([]byte("DKLS23-reshare-party-v1-"))
 	if oldKey != nil {
@@ -521,7 +529,10 @@ func resharingSession(params *tss.Parameters, oldKey *Key, oldSubset, newSubset 
 		h.Write([]byte{0})
 	}
 	var buf [4]byte
-	buf[0] = byte(newThreshold)
+	buf[0] = byte(newThreshold >> 24)
+	buf[1] = byte(newThreshold >> 16)
+	buf[2] = byte(newThreshold >> 8)
+	buf[3] = byte(newThreshold)
 	h.Write(buf[:])
 	return h.Sum(nil)
 }
