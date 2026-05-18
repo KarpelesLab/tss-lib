@@ -438,6 +438,12 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 			return
 		}
 		shareInt := new(big.Int).SetBytes(uc.Share)
+		// Reject non-canonical (>= q) shares — see keygen_party round2
+		// for the rationale (echo-bypass via non-canonical bytes).
+		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
+			rp.Err <- fmt.Errorf("party %s sent non-canonical reshare-share (>= q)", pid)
+			return
+		}
 		sh := &vss.Share{Threshold: rp.newThreshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, rp.newThreshold, vsj) {
 			rp.Err <- fmt.Errorf("party %s reshare-share verification failed", pid)

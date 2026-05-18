@@ -97,6 +97,9 @@ func NewSigning(ctx context.Context, params *tss.Parameters, key *Key, hash []by
 	if len(subset) != key.T+1 {
 		return nil, fmt.Errorf("dklstss: NewSigning subset size %d, expected T+1=%d", len(subset), key.T+1)
 	}
+	if err := validateSortedSubset(subset); err != nil {
+		return nil, fmt.Errorf("dklstss: NewSigning %w", err)
+	}
 
 	// Locate self in subset.
 	self := params.PartyID()
@@ -402,8 +405,10 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 	// Compute φ_i and ŝ_i — note that φ_i represents only THIS party's
 	// portion of φ = Σ k_iρ_i + cross-terms; after broadcast and sum,
 	// the global φ = k·ρ.
-	hashI := new(big.Int).SetBytes(sp.hash)
-	hashI.Mod(hashI, q)
+	// hashToScalar applies SEC 1 §4.1.3 leftmost-bits truncation so a
+	// longer-than-curve-order digest still produces a stdlib-verifiable
+	// signature.
+	hashI := hashToScalar(q, sp.hash)
 	sp.phi_i = new(big.Int).Set(sp.kRhoShare[sp.myPos])
 	t1 := new(big.Int).Mul(sp.rho_i, hashI)
 	t1.Mod(t1, q)

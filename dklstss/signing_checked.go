@@ -180,8 +180,8 @@ func signCheckedCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, 
 	if phi.Sign() == 0 {
 		return nil, errors.New("dklstss: SignChecked φ is 0; retry")
 	}
-	hashI := new(big.Int).SetBytes(hash)
-	hashI.Mod(hashI, q)
+	// SEC 1 §4.1.3 leftmost-bits truncation — see hashToScalar.
+	hashI := hashToScalar(q, hash)
 	sigmaSum := new(big.Int)
 	for i := range signers {
 		t1 := new(big.Int).Mul(rho[i], hashI)

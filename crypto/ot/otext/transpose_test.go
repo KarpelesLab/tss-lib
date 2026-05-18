@@ -99,3 +99,44 @@ func TestTransposeFullPattern(t *testing.T) {
 		}
 	}
 }
+
+// TestTransposeAllZeroRow verifies that an all-zero row is handled
+// identically to a non-zero row. The original implementation had
+// `if b == 0 { continue }` which short-circuited zero bytes; the CT
+// rewrite must process them on the same code path. This regression
+// test guards against re-introducing the shortcut.
+func TestTransposeAllZeroRow(t *testing.T) {
+	const rows, cols = 16, 16
+
+	// Mixed: some all-zero rows, some all-FF rows, some patterned.
+	in := make([][]byte, rows)
+	for r := range in {
+		in[r] = make([]byte, cols/8)
+		switch r % 3 {
+		case 0:
+			// leave all zero
+		case 1:
+			for c := range in[r] {
+				in[r][c] = 0xFF
+			}
+		case 2:
+			for c := range in[r] {
+				in[r][c] = byte(r)
+			}
+		}
+	}
+
+	out := transposeBits(in, rows, cols)
+	// Round-trip check.
+	back := transposeBits(out, cols, rows)
+	require.Equal(t, in, back, "round-trip after transpose of mixed/zero rows must match")
+
+	// Direct check: bit (c, r) of out equals bit (r, c) of in.
+	for r := 0; r < rows; r++ {
+		for c := 0; c < cols; c++ {
+			gotOut := (out[c][r/8] >> (uint(r) & 7)) & 1
+			gotIn := (in[r][c/8] >> (uint(c) & 7)) & 1
+			assert.Equalf(t, gotIn, gotOut, "transpose bit (r=%d, c=%d)", r, c)
+		}
+	}
+}

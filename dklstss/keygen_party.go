@@ -260,6 +260,7 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 	}
 	Pi := kg.params.PartyID()
 	ec := kg.params.EC()
+	q := ec.Params().N
 	threshold := kg.params.Threshold()
 	bcasts := kg.r1Bcasts
 	ucs := kg.r1Unicasts
@@ -280,6 +281,19 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 		}
 
 		shareInt := new(big.Int).SetBytes(uc.Share)
+		// Reject non-canonical (out-of-range) shares. VSS.Verify performs
+		// share·G under a curve scalar mult that reduces mod q, so a
+		// dealer who ships `share + k·q` for any k passes verification
+		// despite an attacker-chosen non-canonical wire encoding. With
+		// the round-1 share digest fed into the echo broadcast for
+		// equivocation detection, accepting non-canonical bytes lets a
+		// malicious dealer ship per-recipient bytes that hash differently
+		// while still verifying — an echo-bypass channel. Reject `>= q`
+		// outright; only the canonical `[0, q)` encoding is permitted.
+		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
+			kg.Err <- fmt.Errorf("party %s sent non-canonical share (>= q)", pid)
+			return
+		}
 		sh := &vss.Share{Threshold: threshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, threshold, vsj) {
 			kg.Err <- fmt.Errorf("party %s VSS share verification failed", pid)

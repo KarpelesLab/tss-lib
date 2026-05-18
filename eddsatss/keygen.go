@@ -90,7 +90,20 @@ func (kg *Keygen) round1() error {
 	}
 	cmt := cmts.NewHashCommitment(kg.params.Rand(), pGFlat...)
 
-	// save
+	// ssidNonce is hard-coded to 0 because every party computes ssid
+	// independently and must produce the same value: a per-party random
+	// nonce would diverge across parties and break the Fiat-Shamir
+	// challenge in the round-2 Schnorr PoK (each verifier uses its own
+	// ssid; mismatched contexts produce different challenges and rejection).
+	//
+	// To gain per-session uniqueness without breaking verification, all
+	// parties would need to agree on a nonce out of band or derive it
+	// deterministically from the round-1 commitments before round 2's
+	// PoK construction. That is a protocol redesign beyond a one-line
+	// fix; the Fiat-Shamir challenge already depends on the prover's
+	// fresh Alpha so PoK soundness holds across replays — only the
+	// transcript-level binding to "session identity" is weakened by the
+	// static nonce.
 	kg.ssidNonce = new(big.Int).SetUint64(0)
 	kg.data.ShareID = ids[i]
 	kg.vs = vs

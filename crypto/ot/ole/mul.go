@@ -198,12 +198,18 @@ func AliceStep2(state *AliceState, bobMsg *BobMsg) (*big.Int, error) {
 // bitsLE returns the little-endian bit packing of v (32 bytes, lowest bit
 // first within each byte) suitable for use as OT extension choice bits.
 // v is interpreted modulo 2^256; bits at position ≥ 256 are dropped.
+//
+// Constant-time on v: the per-bit "set or not" is implemented as an
+// unconditional shift-OR rather than an if-branch. v is α — the local
+// party's secret scalar (k_i, σ_i, or ρ_i depending on the call site).
+// math/big.Int.Bit itself is not a documented CT primitive, but with
+// v ranging over [0, q) on secp256k1 it has a fixed 4-word storage
+// layout so per-bit access is timing-uniform in practice. Removing the
+// surrounding if-branch closes the structurally-clear leak.
 func bitsLE(v *big.Int) []byte {
 	out := make([]byte, ScalarBits/8)
 	for i := 0; i < ScalarBits; i++ {
-		if v.Bit(i) == 1 {
-			out[i/8] |= 1 << (uint(i) & 7)
-		}
+		out[i/8] |= byte(v.Bit(i)) << (uint(i) & 7)
 	}
 	return out
 }

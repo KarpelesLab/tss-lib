@@ -68,6 +68,9 @@ func NewPresign(ctx context.Context, params *tss.Parameters, key *Key, subset ts
 	if len(subset) != key.T+1 {
 		return nil, fmt.Errorf("dklstss: NewPresign subset size %d, expected T+1=%d", len(subset), key.T+1)
 	}
+	if err := validateSortedSubset(subset); err != nil {
+		return nil, fmt.Errorf("dklstss: NewPresign %w", err)
+	}
 	self := params.PartyID()
 	myPos := -1
 	for i, p := range subset {

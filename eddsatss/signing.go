@@ -96,15 +96,25 @@ func (s *Signing) round1() error {
 	ri := common.GetRandomPositiveInt(s.params.Rand(), ec.Params().N)
 	s.ri = ri
 
-	// compute Ri = ri * G
-	pointRi := crypto.ScalarBaseMult(ec, ri)
+	// compute Ri = ri * G via the CT scalar-mult primitive (edwards25519
+	// fixed-base table). `ri` is the per-party EdDSA signing nonce —
+	// leaking its bits via timing is a textbook hidden-number / nonce-bias
+	// attack on EdDSA and recovers the share scalar `wi`. The standard
+	// crypto.ScalarBaseMult routes through Go's elliptic curve impl which
+	// is documented as not constant-time for these curves.
+	pointRi := crypto.CTScalarBaseMultEd25519(ec, ri)
 	s.pointRi = pointRi
 
 	// make commitment to pointRi
 	cmt := cmts.NewHashCommitment(s.params.Rand(), pointRi.X(), pointRi.Y())
 	s.deCommit = cmt.D
 
-	// compute ssid
+	// compute ssid. ssidNonce is hard-coded to 0 because every party
+	// computes ssid independently and must produce the same value (the
+	// Schnorr PoK at round 2 uses ssid as Fiat-Shamir context — see
+	// the matching note in keygen.go for why a per-party random nonce
+	// breaks verification). Per-session uniqueness would require a
+	// coin-flipping round, which is a protocol redesign.
 	s.ssidNonce = new(big.Int).SetUint64(0)
 	var err error
 	s.ssid, err = s.getSSID(1)
