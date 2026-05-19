@@ -198,10 +198,15 @@ func (sp *SigningParty) round1() error {
 	sp.K_i = ctmul.ScalarBaseMultWithRand(ec, sp.k_i, sp.params.Rand())
 
 	// Initialize own diagonal shares.
-	sp.kRhoShare[sp.myPos] = new(big.Int).Mul(sp.k_i, sp.rho_i)
-	sp.kRhoShare[sp.myPos].Mod(sp.kRhoShare[sp.myPos], q)
-	sp.xRhoShare[sp.myPos] = new(big.Int).Mul(sp.sxBySubsetIdx[sp.myPos], sp.rho_i)
-	sp.xRhoShare[sp.myPos].Mod(sp.xRhoShare[sp.myPos], q)
+	// k_i, ρ_i, and sx_i are all per-party secret scalars (sx_i is
+	// λ_i·Xi, the Lagrange-scaled threshold share). Their products are
+	// later combined into the ŝ_i partial signature broadcast in round
+	// 4; computing them via math/big.Int.Mul leaks bits through
+	// timing. The CT mul-add primitive computes both products inside
+	// the same CT path used by the Schnorr response.
+	zero := new(big.Int)
+	sp.kRhoShare[sp.myPos] = crypto.CTScalarMulAddModN(ec, sp.k_i, sp.rho_i, zero)
+	sp.xRhoShare[sp.myPos] = crypto.CTScalarMulAddModN(ec, sp.sxBySubsetIdx[sp.myPos], sp.rho_i, zero)
 
 	// Broadcast K_i to every peer in the subset via a single To==nil
 	// message rather than N-1 unicasts. K_i has identical bytes for
@@ -430,12 +435,12 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 	// signature.
 	hashI := hashToScalar(q, sp.hash)
 	sp.phi_i = new(big.Int).Set(sp.kRhoShare[sp.myPos])
-	t1 := new(big.Int).Mul(sp.rho_i, hashI)
-	t1.Mod(t1, q)
-	t2 := new(big.Int).Mul(sp.r, sp.xRhoShare[sp.myPos])
-	t2.Mod(t2, q)
-	sp.shat_i = new(big.Int).Add(t1, t2)
-	sp.shat_i.Mod(sp.shat_i, q)
+	// ŝ_i = ρ_i·H + r·σ_i. Both ρ_i and σ_i (xRhoShare[myPos]) are
+	// secret; route the two multiplications through the CT mul-add.
+	ec := sp.params.EC()
+	zero := new(big.Int)
+	t1 := crypto.CTScalarMulAddModN(ec, sp.rho_i, hashI, zero)
+	sp.shat_i = crypto.CTScalarMulAddModN(ec, sp.r, sp.xRhoShare[sp.myPos], t1)
 
 	r4 := &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()}
 	for _, Pj := range sp.otherSubset {

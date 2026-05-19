@@ -126,13 +126,13 @@ func signCheckedCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, 
 		return nil, errors.New("dklstss: SignChecked R.X is 0 mod q; retry")
 	}
 
+	// Diagonal terms via CT mul-add — see signing.go for rationale.
+	zeroSx := new(big.Int)
 	kRhoShare := make([]*big.Int, sgn)
 	xRhoShare := make([]*big.Int, sgn)
 	for i := range signers {
-		kRhoShare[i] = new(big.Int).Mul(k[i], rho[i])
-		kRhoShare[i].Mod(kRhoShare[i], q)
-		xRhoShare[i] = new(big.Int).Mul(sx[i], rho[i])
-		xRhoShare[i].Mod(xRhoShare[i], q)
+		kRhoShare[i] = crypto.CTScalarMulAddModN(ec, k[i], rho[i], zeroSx)
+		xRhoShare[i] = crypto.CTScalarMulAddModN(ec, sx[i], rho[i], zeroSx)
 	}
 
 	for ai := 0; ai < sgn; ai++ {
@@ -181,15 +181,16 @@ func signCheckedCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, 
 		return nil, errors.New("dklstss: SignChecked φ is 0; retry")
 	}
 	// SEC 1 §4.1.3 leftmost-bits truncation — see hashToScalar.
+	//
+	// ρ_i and σ_i (xRhoShare[i]) are local secret shares — route the
+	// per-party shati through CT mul-add to close the math/big.Int.Mul
+	// timing channel (see signing.go for the rationale).
 	hashI := hashToScalar(q, hash)
+	zero := new(big.Int)
 	sigmaSum := new(big.Int)
 	for i := range signers {
-		t1 := new(big.Int).Mul(rho[i], hashI)
-		t1.Mod(t1, q)
-		t2 := new(big.Int).Mul(r, xRhoShare[i])
-		t2.Mod(t2, q)
-		shati := new(big.Int).Add(t1, t2)
-		shati.Mod(shati, q)
+		t1 := crypto.CTScalarMulAddModN(ec, rho[i], hashI, zero)
+		shati := crypto.CTScalarMulAddModN(ec, r, xRhoShare[i], t1)
 		sigmaSum.Add(sigmaSum, shati)
 		sigmaSum.Mod(sigmaSum, q)
 	}

@@ -156,13 +156,13 @@ func Presign(keys []*Key, signerIdx []int, rng io.Reader) (*PresignOutput, error
 		return nil, errors.New("dklstss: Presign R.X mod q is 0; retry")
 	}
 
+	// Diagonal terms via CT mul-add — see signing.go for rationale.
+	zeroSx := new(big.Int)
 	kRhoShare := make([]*big.Int, sgn)
 	xRhoShare := make([]*big.Int, sgn)
 	for i := range signers {
-		kRhoShare[i] = new(big.Int).Mul(k[i], rho[i])
-		kRhoShare[i].Mod(kRhoShare[i], q)
-		xRhoShare[i] = new(big.Int).Mul(sx[i], rho[i])
-		xRhoShare[i].Mod(xRhoShare[i], q)
+		kRhoShare[i] = crypto.CTScalarMulAddModN(ec, k[i], rho[i], zeroSx)
+		xRhoShare[i] = crypto.CTScalarMulAddModN(ec, sx[i], rho[i], zeroSx)
 	}
 
 	for ai := 0; ai < sgn; ai++ {
@@ -332,21 +332,29 @@ func SignWithPresign(presign *PresignOutput, hash []byte, tweak *big.Int) (*Sign
 		tweakMod = new(big.Int).Mod(tweak, q)
 	}
 
+	// Compose ŝ_i = ρ_i·H + r·σ_i (mod q) via the constant-time
+	// mul-add primitive. Both ρ_i and σ_i are local secret shares —
+	// leaking bits of either via math/big.Int.Mul timing recovers
+	// per-party signing material. The two-call form:
+	//   t1 = ρ_i·H + 0
+	//   ŝ_i = r·σ_i + t1
+	// keeps every secret-input multiplication inside a CT primitive.
+	//
+	// With an HD tweak τ the effective share is σ_i + τ·ρ_i, computed
+	// in CT as `tweak·ρ_i + σ_i` before the main sum.
+	ec := tss.S256()
+	zero := new(big.Int)
 	sigmaSum := new(big.Int)
 	for i := 0; i < sgn; i++ {
 		sigma := presign.parties[i].sigma
+		rho := presign.parties[i].rho
 		if tweakMod != nil {
-			extra := new(big.Int).Mul(tweakMod, presign.parties[i].rho)
-			extra.Mod(extra, q)
-			sigma = new(big.Int).Add(sigma, extra)
-			sigma.Mod(sigma, q)
+			sigma = crypto.CTScalarMulAddModN(ec, tweakMod, rho, sigma)
 		}
-		t1 := new(big.Int).Mul(presign.parties[i].rho, hashI)
-		t1.Mod(t1, q)
-		t2 := new(big.Int).Mul(presign.r, sigma)
-		t2.Mod(t2, q)
-		shati := new(big.Int).Add(t1, t2)
-		shati.Mod(shati, q)
+		t1 := crypto.CTScalarMulAddModN(ec, rho, hashI, zero)
+		shati := crypto.CTScalarMulAddModN(ec, presign.r, sigma, t1)
+		// Sum across signers — Add is benign in big.Int (fixed-word
+		// addition), only the Mul operations need CT treatment.
 		sigmaSum.Add(sigmaSum, shati)
 		sigmaSum.Mod(sigmaSum, q)
 	}

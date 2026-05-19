@@ -7,6 +7,7 @@ import (
 	"math/big"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
+	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/group"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
@@ -140,11 +141,19 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	}
 	lambda_i := frost.LagrangeCoefficient(cs, Pi.KeyInt(), signerIDs)
 
+	// z_i = d_i + e_i · ρ_i + λ_i · s_i · c (mod L)
+	//
+	// Constant-time decomposition via crypto.CTScalarMulAddModN — see
+	// frosttss/signing.go round2 for the rationale. The Ristretto255
+	// group order equals the Ed25519 group order L, so the same
+	// edwards25519.ScMulAdd primitive applies under the Edwards curve
+	// dispatch.
 	rho_i := bindingFactors[Pi.KeyInt().String()]
-	modQ := common.ModInt(g.Order())
-	term2 := modQ.Mul(s.ei, rho_i)
-	term3 := modQ.Mul(modQ.Mul(lambda_i, s.key.Xi), c)
-	zi := modQ.Add(modQ.Add(s.di, term2), term3)
+	ec := frost.EdwardsCurve()
+	zero := new(big.Int)
+	t1 := crypto.CTScalarMulAddModN(ec, s.ei, rho_i, s.di)
+	t2 := crypto.CTScalarMulAddModN(ec, lambda_i, s.key.Xi, zero)
+	zi := crypto.CTScalarMulAddModN(ec, t2, c, t1)
 
 	// Broadcast z_i via a single To==nil message (identical per recipient).
 	r2 := &signRound2msg{Z: g.EncodeScalar(zi)}
