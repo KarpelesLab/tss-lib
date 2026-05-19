@@ -1,6 +1,7 @@
 package dklstss
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,5 +146,57 @@ func Load(r io.Reader) (*Key, error) {
 	if err := k.ValidateBasic(); err != nil {
 		return nil, fmt.Errorf("dklstss: Load loaded key fails ValidateBasic: %w", err)
 	}
+	// Cross-check ChainCode against the canonical hash of the loaded
+	// ECDSAPub. A tampered ChainCode on disk would otherwise cause every
+	// party's HD derivation to diverge silently — the key signs correctly
+	// but child keys are wrong.
+	want := deriveChainCode(k.ECDSAPub)
+	if !bytes.Equal(k.ChainCode, want) {
+		return nil, errors.New("dklstss: Load ChainCode does not match canonical hash of ECDSAPub")
+	}
+	// Cross-check the joint public key against the sum of BigXj weighted
+	// by Lagrange coefficients at 0. A tampered ECDSAPub on disk would
+	// otherwise yield a Key that signs valid signatures under the wrong
+	// public key — invisible to the loader, dangerous to the verifier
+	// downstream.
+	if err := verifyPubMatchesBigXj(k); err != nil {
+		return nil, err
+	}
 	return k, nil
+}
+
+// verifyPubMatchesBigXj asserts that ECDSAPub equals Σ λ_j · BigXj[j] over
+// any T+1 party subset. We use the first T+1 parties for determinism.
+// Internally consistent keys produced by Keygen / Refresh / Reshare /
+// Load(round-trip) satisfy this; tampered loads do not.
+func verifyPubMatchesBigXj(k *Key) error {
+	if k.T+1 > len(k.BigXj) {
+		return fmt.Errorf("dklstss: Load not enough BigXj (%d) for threshold T+1=%d", len(k.BigXj), k.T+1)
+	}
+	q := k.Curve.Params().N
+	ids := make([]*big.Int, k.T+1)
+	for i := 0; i < k.T+1; i++ {
+		ids[i] = k.PartyIDs[i].KeyInt()
+	}
+	var acc *crypto.ECPoint
+	for i := 0; i < k.T+1; i++ {
+		lam, err := lagrangeCoefficient(q, ids, i)
+		if err != nil {
+			return fmt.Errorf("dklstss: Load lagrange[%d]: %w", i, err)
+		}
+		term := k.BigXj[i].ScalarMult(lam)
+		if acc == nil {
+			acc = term
+			continue
+		}
+		next, err := acc.Add(term)
+		if err != nil {
+			return fmt.Errorf("dklstss: Load aggregate[%d]: %w", i, err)
+		}
+		acc = next
+	}
+	if !acc.Equals(k.ECDSAPub) {
+		return errors.New("dklstss: Load ECDSAPub does not match Σ λ_j · BigXj[j] — key was tampered with on disk")
+	}
+	return nil
 }

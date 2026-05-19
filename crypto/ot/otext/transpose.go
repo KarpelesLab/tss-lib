@@ -38,19 +38,26 @@ func transposeBits(in [][]byte, rows, cols int) [][]byte {
 	for c := 0; c < cols; c++ {
 		out[c] = make([]byte, rowBytes)
 	}
+	// Constant-time on `in[r][c]`: every byte and every bit is processed
+	// unconditionally. The `if b == 0 { continue }` shortcut that used to
+	// live here was an observable data-dependent branch — for the SENDER
+	// side of the OT extension, `in` is the q matrix whose rows are
+	// `prgExpand(seed) XOR (Δ_j · U[j])`. With U known to an attacker,
+	// distinguishing `expansion[b] == 0` from `expansion[b] == U[j][b]`
+	// via timing leaks Δ_j. Each `if (b>>cBit)&1 == 1` was likewise
+	// secret-bit-dependent. The form below uses arithmetic-mask OR so
+	// the control flow is independent of bit values.
 	for r := 0; r < rows; r++ {
 		rowByteIdx := r / 8
 		rowBitMask := byte(1) << (uint(r) & 7)
 		for cByte := 0; cByte < colBytes; cByte++ {
 			b := in[r][cByte]
-			if b == 0 {
-				continue
-			}
 			base := cByte * 8
 			for cBit := 0; cBit < 8; cBit++ {
-				if (b>>uint(cBit))&1 == 1 {
-					out[base+cBit][rowByteIdx] |= rowBitMask
-				}
+				// bit ∈ {0,1}; mask = 0xFF if bit==1 else 0x00.
+				bit := (b >> uint(cBit)) & 1
+				mask := byte(-int8(bit))
+				out[base+cBit][rowByteIdx] |= rowBitMask & mask
 			}
 		}
 	}

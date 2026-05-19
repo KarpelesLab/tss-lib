@@ -236,6 +236,7 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 	}
 	Pi := rp.params.PartyID()
 	ec := rp.params.EC()
+	q := ec.Params().N
 	threshold := rp.old.T
 	bcasts := rp.r1Bcasts
 	ucs := rp.r1Unicasts
@@ -254,6 +255,12 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 			return
 		}
 		shareInt := new(big.Int).SetBytes(uc.Share)
+		// Reject non-canonical (>= q) shares — see keygen_party round2
+		// for the rationale (echo-bypass via non-canonical bytes).
+		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
+			rp.Err <- fmt.Errorf("party %s sent non-canonical refresh-share (>= q)", pid)
+			return
+		}
 		if !verifyZeroConstShare(vsj, Pi.KeyInt(), shareInt) {
 			rp.Err <- fmt.Errorf("party %s refresh-share verification failed", pid)
 			return
@@ -334,7 +341,11 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 	newBigXj := make([]*crypto.ECPoint, n)
 	for _, pj := range parties {
 		// Compute delta_j · G via commitments.
-		deltaG := evalCommitmentSumZeroConst(rp.vsSelf, rp.peerVs, pj.KeyInt())
+		deltaG, err := evalCommitmentSumZeroConst(rp.vsSelf, rp.peerVs, pj.KeyInt())
+		if err != nil {
+			rp.Err <- fmt.Errorf("delta·G[%d]: %w", pj.Index, err)
+			return
+		}
 		newPoint, err := rp.old.BigXj[pj.Index].Add(deltaG)
 		if err != nil {
 			rp.Err <- fmt.Errorf("new BigXj[%d]: %w", pj.Index, err)
@@ -415,35 +426,51 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 // evalCommitmentSumZeroConst computes Σ_i (f_i(id_j) · G) where each
 // f_i has zero constant term, given the local Vs and each peer's Vs.
 // The curve is inferred from the first point.
-func evalCommitmentSumZeroConst(vsSelf []*crypto.ECPoint, peerVs map[string][]*crypto.ECPoint, id *big.Int) *crypto.ECPoint {
+//
+// Returns an error if any point arithmetic fails. Previously this
+// function silently swallowed Add errors (`if err == nil { acc = sum }`)
+// which let a peer with malformed commitments shift another party's
+// BigXj into an unrelated value — the self-consistency check at the
+// caller's `Pi.Index` slot would still pass but the j ≠ self slots
+// could end up off-protocol. Propagating the error surfaces the
+// problem immediately rather than producing a key with bad public
+// commitments.
+func evalCommitmentSumZeroConst(vsSelf []*crypto.ECPoint, peerVs map[string][]*crypto.ECPoint, id *big.Int) (*crypto.ECPoint, error) {
 	if len(vsSelf) == 0 {
-		return nil
+		return nil, errors.New("dklstss: evalCommitmentSumZeroConst empty vsSelf")
 	}
 	curve := vsSelf[0].Curve()
 	q := curve.Params().N
 
-	eval := func(Vs []*crypto.ECPoint) *crypto.ECPoint {
+	eval := func(Vs []*crypto.ECPoint) (*crypto.ECPoint, error) {
 		idPow := new(big.Int).Mod(id, q)
 		var acc *crypto.ECPoint
-		for _, V := range Vs {
+		for k, V := range Vs {
 			term := V.ScalarMult(idPow)
 			if acc == nil {
 				acc = term
 			} else {
 				sum, err := acc.Add(term)
-				if err == nil {
-					acc = sum
+				if err != nil {
+					return nil, fmt.Errorf("Vs[%d] addition: %w", k, err)
 				}
+				acc = sum
 			}
 			idPow = new(big.Int).Mul(idPow, id)
 			idPow.Mod(idPow, q)
 		}
-		return acc
+		return acc, nil
 	}
 
-	out := eval(vsSelf)
-	for _, vs := range peerVs {
-		add := eval(vs)
+	out, err := eval(vsSelf)
+	if err != nil {
+		return nil, fmt.Errorf("vsSelf: %w", err)
+	}
+	for peerKey, vs := range peerVs {
+		add, err := eval(vs)
+		if err != nil {
+			return nil, fmt.Errorf("peer %s: %w", peerKey, err)
+		}
 		if add == nil {
 			continue
 		}
@@ -452,11 +479,12 @@ func evalCommitmentSumZeroConst(vsSelf []*crypto.ECPoint, peerVs map[string][]*c
 			continue
 		}
 		sum, err := out.Add(add)
-		if err == nil {
-			out = sum
+		if err != nil {
+			return nil, fmt.Errorf("aggregate (peer %s): %w", peerKey, err)
 		}
+		out = sum
 	}
-	return out
+	return out, nil
 }
 
 // refreshR1Bcast is the round-1 BROADCAST: Vs commitments to the

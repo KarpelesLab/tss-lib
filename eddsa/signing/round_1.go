@@ -43,8 +43,13 @@ func (round *round1) Start() error {
 	// 1. select ri
 	ri := common.GetRandomPositiveInt(round.Rand(), round.Params().EC().Params().N)
 
-	// 2. make commitment
-	pointRi := crypto.ScalarBaseMult(round.Params().EC(), ri)
+	// 2. make commitment.
+	// ri is the per-party EdDSA signing nonce. Route ri·G through the
+	// constant-time edwards25519 fixed-base table — the standard
+	// crypto.ScalarBaseMult uses Go's non-CT elliptic curve impl and
+	// leaks nonce bits, which is a textbook hidden-number attack
+	// against EdDSA.
+	pointRi := crypto.CTScalarBaseMultEd25519(round.Params().EC(), ri)
 	cmt := commitments.NewHashCommitment(round.Rand(), pointRi.X(), pointRi.Y())
 
 	// 3. store r1 message pieces

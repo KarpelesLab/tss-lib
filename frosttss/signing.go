@@ -7,6 +7,7 @@ import (
 
 	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/tss-lib/v2/common"
+	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/group"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
@@ -70,8 +71,16 @@ func (s *Signing) round1() error {
 
 	s.di = g.RandomScalar(s.params.Rand())
 	s.ei = g.RandomScalar(s.params.Rand())
-	s.Di = g.ScalarBaseMult(s.di)
-	s.Ei = g.ScalarBaseMult(s.ei)
+	// D_i = d_i · G and E_i = e_i · G — the per-party FROST nonces.
+	// Leaking d_i or e_i via timing is a hidden-number attack on the
+	// joint signature and recovers the share scalar. group.Ed25519's
+	// ScalarBaseMult uses crypto.ScalarBaseMult which is non-CT for
+	// Ed25519; bypass via crypto.CTScalarBaseMultEd25519 (edwards25519
+	// fixed-base table) and adapt the result back into the Group
+	// abstraction.
+	ec := frost.EdwardsCurve()
+	s.Di = group.AdaptECPoint(crypto.CTScalarBaseMultEd25519(ec, s.di))
+	s.Ei = group.AdaptECPoint(crypto.CTScalarBaseMultEd25519(ec, s.ei))
 
 	var otherIds []*tss.PartyID
 	for n, p := range s.params.Parties().IDs() {

@@ -222,18 +222,26 @@ func (s *ExtSender) Extend(sid []byte, msg *ExtendMsg1) (m0, m1 [][KeyLen]byte, 
 	// must match the value the receiver passed to its own prgExpand so
 	// the sender's expansion lines up with t_{Δ_j}[j]; this is the
 	// per-call PRG keying that prevents seed reuse across Extend calls.
+	//
+	// Constant-time on Δ: the per-row "XOR with u_j or not" decision is
+	// implemented as a byte-level conditional XOR (mask 0xFF or 0x00)
+	// rather than an if-branch. Δ is the long-term OT-extension sender's
+	// secret correlation — a Δ-dependent branch here is observable via
+	// timing or cache side channels and, over repeated Extend calls,
+	// leaks Δ bit by bit. With Δ recovered, an attacker can recompute
+	// every OT-extension output, which in DKLs23 is equivalent to key
+	// extraction. The CT mask form runs every row through the same
+	// memory and control flow.
 	q := make([][]byte, Kappa)
 	for j := 0; j < Kappa; j++ {
 		deltaBit := (s.delta[j/8] >> (uint(j) & 7)) & 1
+		mask := byte(-int8(deltaBit)) // 0xFF if 1, 0x00 if 0
 		expansion := prgExpand(s.seeds[j], sid, lb)
-		if deltaBit == 1 {
-			q[j] = make([]byte, lb)
-			for b := 0; b < lb; b++ {
-				q[j][b] = expansion[b] ^ msg.U[j][b]
-			}
-		} else {
-			q[j] = expansion
+		row := make([]byte, lb)
+		for b := 0; b < lb; b++ {
+			row[b] = expansion[b] ^ (msg.U[j][b] & mask)
 		}
+		q[j] = row
 	}
 
 	// Transpose q from (κ × L) to (L × κ).

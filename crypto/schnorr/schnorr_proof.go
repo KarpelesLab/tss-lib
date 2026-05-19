@@ -77,9 +77,14 @@ func (pf *ZKProof) Verify(Session []byte, X *crypto.ECPoint) bool {
 	return aXc.X().Cmp(tG.X()) == 0 && aXc.Y().Cmp(tG.Y()) == 0
 }
 
-// ValidateBasic checks that all fields of the ZKProof are non-nil.
+// ValidateBasic checks that all fields of the ZKProof are non-nil and that
+// Alpha is a valid curve point. The Alpha.ValidateBasic() call closes a
+// panic vector: ZKProof.Verify calls pf.Alpha.X() which would dereference
+// a nil coordinate (`big.Int.Set(nil)` panics) if a caller-supplied
+// ZKProof has Alpha != nil but with nil coords. ZKVProof.ValidateBasic
+// already includes this check; the two now match.
 func (pf *ZKProof) ValidateBasic() bool {
-	return pf.T != nil && pf.Alpha != nil
+	return pf.T != nil && pf.Alpha != nil && pf.Alpha.ValidateBasic()
 }
 
 // NewZKProof constructs a new Schnorr ZK proof of knowledge s_i, l_i such that V_i = R^s_i, g^l_i (GG18Spec Fig. 17)

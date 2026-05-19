@@ -34,14 +34,29 @@ func MustGetRandomInt(rand io.Reader, bits int) *big.Int {
 	return n
 }
 
-// GetRandomPositiveInt returns a random positive integer less than the given upper bound.
+// GetRandomPositiveInt returns a random strictly positive integer less
+// than the given upper bound — i.e. uniformly sampled from [1, lessThan).
+//
+// The "Positive" in the name historically permitted 0; cryptographic
+// callers (curve scalars, blinding factors, signing nonces) almost
+// universally need 0 excluded. The probability of accidentally landing
+// on 0 is 1/lessThan ≈ 2^{-256} for curve-order moduli, so existing
+// callers are unaffected in practice; the rejection closes a latent
+// foot-gun without a meaningful performance cost.
 func GetRandomPositiveInt(rand io.Reader, lessThan *big.Int) *big.Int {
 	if lessThan == nil || zero.Cmp(lessThan) != -1 {
+		return nil
+	}
+	if lessThan.Cmp(one) <= 0 {
+		// No positive integer < 1 exists.
 		return nil
 	}
 	var try *big.Int
 	for {
 		try = MustGetRandomInt(rand, lessThan.BitLen())
+		if try.Sign() == 0 {
+			continue
+		}
 		if try.Cmp(lessThan) < 0 {
 			break
 		}

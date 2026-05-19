@@ -79,8 +79,14 @@ func setupPairs(n int, sidPrefix []byte, rng io.Reader) ([][]*PairOTState, error
 		for j := i + 1; j < n; j++ {
 			// Direction A: party i is ExtReceiver (Alice in future ΠMul),
 			// party j is ExtSender (Bob).
+			//
+			// Encode (i, j) as two 4-byte big-endian uint32 values rather
+			// than `byte(i), byte(j)` — the byte cast truncates to the low
+			// 8 bits, so any setup with n > 256 would produce colliding
+			// sids across distinct pairs. With 4-byte encoding the sid is
+			// injective for any practical n (≤ 2^32 parties).
 			sidA := append([]byte(nil), sidPrefix...)
-			sidA = append(sidA, byte(i), byte(j), 'A')
+			sidA = append(sidA, encodePartyPair(i, j, 'A')...)
 			rcvA, sndA, err := runBaseOTPair(sidA, rng)
 			if err != nil {
 				return nil, fmt.Errorf("dklstss: setupPairs (%d,%d)A: %w", i, j, err)
@@ -89,7 +95,7 @@ func setupPairs(n int, sidPrefix []byte, rng io.Reader) ([][]*PairOTState, error
 			// Direction B: party j is ExtReceiver (Alice when j initiates
 			// ΠMul against i), party i is ExtSender (Bob).
 			sidB := append([]byte(nil), sidPrefix...)
-			sidB = append(sidB, byte(i), byte(j), 'B')
+			sidB = append(sidB, encodePartyPair(i, j, 'B')...)
 			rcvB, sndB, err := runBaseOTPair(sidB, rng)
 			if err != nil {
 				return nil, fmt.Errorf("dklstss: setupPairs (%d,%d)B: %w", i, j, err)
@@ -111,4 +117,16 @@ func setupPairs(n int, sidPrefix []byte, rng io.Reader) ([][]*PairOTState, error
 		}
 	}
 	return ot, nil
+}
+
+// encodePartyPair packs (i, j, dir) into a 9-byte injective encoding:
+// 4 bytes big-endian uint32 for i, 4 bytes big-endian uint32 for j, plus
+// a one-byte direction tag. The encoding is injective for i, j ∈ [0,
+// 2^32) which exceeds any plausible TSS deployment size.
+func encodePartyPair(i, j int, dir byte) []byte {
+	return []byte{
+		byte(uint32(i) >> 24), byte(uint32(i) >> 16), byte(uint32(i) >> 8), byte(i),
+		byte(uint32(j) >> 24), byte(uint32(j) >> 16), byte(uint32(j) >> 8), byte(j),
+		dir,
+	}
 }

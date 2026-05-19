@@ -318,9 +318,10 @@ func SignWithPresign(presign *PresignOutput, hash []byte, tweak *big.Int) (*Sign
 		return nil, errors.New("dklstss: SignWithPresign φ is 0; presign was malformed")
 	}
 
-	// Tweak: add to first signer's σ contribution.
-	hashI := new(big.Int).SetBytes(hash)
-	hashI.Mod(hashI, q)
+	// Tweak: add to first signer's σ contribution. hashToScalar applies
+	// SEC 1 §4.1.3 leftmost-bits truncation; required for digests longer
+	// than the curve order to round-trip through crypto/ecdsa.Verify.
+	hashI := hashToScalar(q, hash)
 
 	// HD tweak handling: with tweak τ, the effective signing key is
 	// x_new = x + τ, so σ_new = x_new · ρ = σ + τ · ρ. Since ρ = Σ ρ_j,

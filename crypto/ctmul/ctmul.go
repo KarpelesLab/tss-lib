@@ -26,6 +26,14 @@ func ScalarMult(P *crypto.ECPoint, k *big.Int) *crypto.ECPoint {
 // ScalarMultWithRand is ScalarMult with an explicit random source.
 // Provided for tests that need deterministic output; production callers
 // should use ScalarMult.
+//
+// On secp256k1 the constant-time ladder requires fresh randomness for the
+// Z-randomization and scalar-blinding side-channel defenses. If the
+// provided RNG returns an error, the function panics rather than silently
+// downgrading to the standard (non-CT) primitive — a downgrade would
+// quietly disable the entire reason callers reach for ctmul. RNG failures
+// at this level are catastrophic system events; failing loudly is the
+// correct behavior.
 func ScalarMultWithRand(P *crypto.ECPoint, k *big.Int, rng io.Reader) *crypto.ECPoint {
 	if P == nil || k == nil {
 		return nil
@@ -35,9 +43,9 @@ func ScalarMultWithRand(P *crypto.ECPoint, k *big.Int, rng io.Reader) *crypto.EC
 	}
 	out, err := ctScalarMultSecp256k1(P, k, rng)
 	if err != nil {
-		// Fallback only on RNG failure; the constant-time path itself
-		// cannot fail given valid inputs.
-		return P.ScalarMult(k)
+		// Silent fallback would lose the CT guarantee callers explicitly
+		// reached for ctmul to obtain. RNG failure → panic.
+		panic("ctmul: RNG failure in constant-time scalar mult: " + err.Error())
 	}
 	return out
 }

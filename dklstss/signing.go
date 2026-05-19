@@ -229,8 +229,10 @@ func signCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, rng io.
 	}
 
 	// Round 3b: each party computes ŝ_i = ρ_i · H(m) + r · σ_i mod q, reveal.
-	hashI := new(big.Int).SetBytes(hash)
-	hashI.Mod(hashI, q)
+	// hashToScalar applies SEC 1 §4.1.3 truncation (leftmost q.BitLen() bits)
+	// so digests longer than the curve order still produce signatures that
+	// verify under crypto/ecdsa.Verify.
+	hashI := hashToScalar(q, hash)
 	sigmaSum := new(big.Int)
 	for i := range signers {
 		term1 := new(big.Int).Mul(rho[i], hashI)
