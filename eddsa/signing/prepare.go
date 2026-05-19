@@ -12,6 +12,7 @@ import (
 	"math/big"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
+	"github.com/KarpelesLab/tss-lib/v2/crypto"
 )
 
 // PrepareForSigning(), Fig. 7
@@ -35,9 +36,11 @@ func PrepareForSigning(ec elliptic.Curve, i, pax int, xi *big.Int, ks []*big.Int
 		if ksj.Cmp(ksi) == 0 {
 			panic(fmt.Errorf("index of two parties are equal"))
 		}
-		// big.Int Div is calculated as: a/b = a * modInv(b,q)
+		// big.Int Div is calculated as: a/b = a * modInv(b,q).
+		// coef is public (party indexes); the running product `wi`
+		// carries the secret share xi, so the wi·coef step must be CT.
 		coef := modQ.Mul(ks[j], modQ.ModInverse(new(big.Int).Sub(ksj, ksi)))
-		wi = modQ.Mul(wi, coef)
+		wi = crypto.CTScalarMulAddModN(ec, wi, coef, new(big.Int))
 	}
 
 	return

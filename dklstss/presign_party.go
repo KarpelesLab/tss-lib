@@ -150,10 +150,10 @@ func (pp *PresignParty) round1() error {
 	pp.rho_i = common.GetRandomPositiveInt(pp.params.Rand(), q)
 	pp.K_i = ctmul.ScalarBaseMultWithRand(ec, pp.k_i, pp.params.Rand())
 
-	pp.kRhoShare[pp.myPos] = new(big.Int).Mul(pp.k_i, pp.rho_i)
-	pp.kRhoShare[pp.myPos].Mod(pp.kRhoShare[pp.myPos], q)
-	pp.xRhoShare[pp.myPos] = new(big.Int).Mul(pp.sxBySubsetIdx[pp.myPos], pp.rho_i)
-	pp.xRhoShare[pp.myPos].Mod(pp.xRhoShare[pp.myPos], q)
+	// Diagonal terms via CT mul-add — see signing.go for rationale.
+	zero := new(big.Int)
+	pp.kRhoShare[pp.myPos] = crypto.CTScalarMulAddModN(ec, pp.k_i, pp.rho_i, zero)
+	pp.xRhoShare[pp.myPos] = crypto.CTScalarMulAddModN(ec, pp.sxBySubsetIdx[pp.myPos], pp.rho_i, zero)
 
 	// Broadcast K_i (identical bytes for every recipient). Sent as a
 	// single To==nil message rather than N-1 unicasts so a well-behaved

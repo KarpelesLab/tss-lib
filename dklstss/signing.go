@@ -157,14 +157,15 @@ func signCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, rng io.
 	// Per-party accumulators:
 	//   kRhoShare[i] = k_i·ρ_i + Σ_{j≠i} (α-share when i is Alice + β-share when i is Bob)
 	//   xRhoShare[i] = s_x_i·ρ_i + Σ_{j≠i} (...)
+	// Diagonal terms: own k_i · ρ_i and sx_i · ρ_i. Every factor is a
+	// local secret scalar; route the multiplications through the CT
+	// mul-add primitive (with c=0).
+	zeroSx := new(big.Int)
 	kRhoShare := make([]*big.Int, sgn)
 	xRhoShare := make([]*big.Int, sgn)
 	for i := range signers {
-		// Diagonal terms: own k_i · ρ_i and s_x_i · ρ_i.
-		kRhoShare[i] = new(big.Int).Mul(k[i], rho[i])
-		kRhoShare[i].Mod(kRhoShare[i], q)
-		xRhoShare[i] = new(big.Int).Mul(sx[i], rho[i])
-		xRhoShare[i].Mod(xRhoShare[i], q)
+		kRhoShare[i] = crypto.CTScalarMulAddModN(ec, k[i], rho[i], zeroSx)
+		xRhoShare[i] = crypto.CTScalarMulAddModN(ec, sx[i], rho[i], zeroSx)
 	}
 
 	for ai := 0; ai < sgn; ai++ {
@@ -232,15 +233,16 @@ func signCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, rng io.
 	// hashToScalar applies SEC 1 §4.1.3 truncation (leftmost q.BitLen() bits)
 	// so digests longer than the curve order still produce signatures that
 	// verify under crypto/ecdsa.Verify.
+	//
+	// ρ_i and σ_i are local secret shares — route their multiplications
+	// through crypto.CTScalarMulAddModN to close the math/big.Int.Mul
+	// timing channel.
 	hashI := hashToScalar(q, hash)
+	zero := new(big.Int)
 	sigmaSum := new(big.Int)
 	for i := range signers {
-		term1 := new(big.Int).Mul(rho[i], hashI)
-		term1.Mod(term1, q)
-		term2 := new(big.Int).Mul(r, xRhoShare[i])
-		term2.Mod(term2, q)
-		shati := new(big.Int).Add(term1, term2)
-		shati.Mod(shati, q)
+		t1 := crypto.CTScalarMulAddModN(ec, rho[i], hashI, zero)
+		shati := crypto.CTScalarMulAddModN(ec, r, xRhoShare[i], t1)
 		sigmaSum.Add(sigmaSum, shati)
 		sigmaSum.Mod(sigmaSum, q)
 	}

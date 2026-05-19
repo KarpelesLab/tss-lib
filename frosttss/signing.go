@@ -166,12 +166,24 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	}
 	lambda_i := frost.LagrangeCoefficient(cs, Pi.KeyInt(), signerIDs)
 
-	// z_i = d_i + e_i * rho_i + lambda_i * s_i * c (mod L)
+	// z_i = d_i + e_i · ρ_i + λ_i · s_i · c (mod L)
+	//
+	// Both nonces (d_i, e_i) and the share s_i are secret. Composing the
+	// product `λ_i · s_i · c` through math/big.Int.Mul leaks bits of s_i;
+	// composing `e_i · ρ_i` leaks bits of e_i. Re-express the expression
+	// as a sequence of constant-time mul-add operations via
+	// crypto.CTScalarMulAddModN (which routes through edwards25519.ScMulAdd
+	// on Ed25519 — the same primitive RFC 8032 stdlib EdDSA uses):
+	//
+	//   t1 = e_i · ρ_i + d_i        (secret · public + secret)
+	//   t2 = λ_i · s_i + 0          (public · secret)
+	//   z_i = t2 · c + t1           (secret · public + secret)
 	rho_i := bindingFactors[Pi.KeyInt().String()]
-	modQ := common.ModInt(g.Order())
-	term2 := modQ.Mul(s.ei, rho_i)
-	term3 := modQ.Mul(modQ.Mul(lambda_i, s.key.Xi), c)
-	zi := modQ.Add(modQ.Add(s.di, term2), term3)
+	ec := frost.EdwardsCurve()
+	zero := new(big.Int)
+	t1 := crypto.CTScalarMulAddModN(ec, s.ei, rho_i, s.di)
+	t2 := crypto.CTScalarMulAddModN(ec, lambda_i, s.key.Xi, zero)
+	zi := crypto.CTScalarMulAddModN(ec, t2, c, t1)
 
 	// Broadcast z_i via a single To==nil message (identical per recipient).
 	r2 := &signRound2msg{Z: g.EncodeScalar(zi)}
