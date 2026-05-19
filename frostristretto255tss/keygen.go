@@ -2,6 +2,7 @@ package frostristretto255tss
 
 import (
 	"context"
+	"sync"
 	"fmt"
 	"math/big"
 
@@ -23,6 +24,11 @@ type Keygen struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards on Done/Err so multi-writer error paths cannot block on
+	// the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewKeygen starts the FROST(ristretto255) Pedersen DKG. The params.EC()
@@ -78,15 +84,14 @@ func (kg *Keygen) round1() error {
 		otherIds = append(otherIds, p)
 	}
 
+	// Broadcast round 1 via a single To==nil message — see frosttss/keygen.go.
 	r1 := &keygenRound1msg{
 		PolyCommitments: encodedCommitments,
 		SchnorrR:        pok.R.Bytes(),
 		SchnorrT:        g.EncodeScalar(pok.T),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("frost:ristretto255:keygen:round1", r1, Pi, p)
-		kg.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("frost:ristretto255:keygen:round1", r1, Pi, nil)
+	kg.params.Broker().Receive(m)
 
 	rcv := tss.NewJsonExpect[keygenRound1msg]("frost:ristretto255:keygen:round1", otherIds, kg.round2)
 	kg.params.Broker().Connect("frost:ristretto255:keygen:round1", rcv)
@@ -95,7 +100,7 @@ func (kg *Keygen) round1() error {
 
 func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	if kg.ctx.Err() != nil {
-		kg.Err <- kg.ctx.Err()
+		sendOnce(&kg.errOnce, kg.Err, kg.ctx.Err())
 		return
 	}
 	Pi := kg.params.PartyID()
@@ -105,15 +110,15 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	for n, pid := range otherIds {
 		r1 := r1msgs[n]
 		if len(r1.PolyCommitments) != kg.params.Threshold()+1 {
-			kg.Err <- fmt.Errorf("party %s sent %d commitments, expected %d",
-				pid, len(r1.PolyCommitments), kg.params.Threshold()+1)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent %d commitments, expected %d",
+				pid, len(r1.PolyCommitments), kg.params.Threshold()+1))
 			return
 		}
 		vsj := make([]group.Element, len(r1.PolyCommitments))
 		for k, enc := range r1.PolyCommitments {
 			el, err := g.DecodeElement(enc)
 			if err != nil {
-				kg.Err <- fmt.Errorf("party %s sent invalid poly commitment %d: %w", pid, k, err)
+				sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent invalid poly commitment %d: %w", pid, k, err))
 				return
 			}
 			vsj[k] = el
@@ -122,17 +127,17 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 
 		Rj, err := g.DecodeElement(r1.SchnorrR)
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s sent invalid Schnorr R: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent invalid Schnorr R: %w", pid, err))
 			return
 		}
 		Tj, err := g.DecodeScalar(r1.SchnorrT)
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s sent invalid Schnorr T: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent invalid Schnorr T: %w", pid, err))
 			return
 		}
 		session := buildKeygenSession(pid.KeyInt())
 		if !schnorrVerify(g, session, vsj[0], &schnorrProof{R: Rj, T: Tj}) {
-			kg.Err <- fmt.Errorf("party %s Schnorr PoK verification failed", pid)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s Schnorr PoK verification failed", pid))
 			return
 		}
 	}
@@ -146,7 +151,7 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 			}
 		}
 		if shareForPj == nil {
-			kg.Err <- fmt.Errorf("internal: missing share for party %s", Pj)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("internal: missing share for party %s", Pj))
 			return
 		}
 		r2 := &keygenRound2msg{Share: g.EncodeScalar(shareForPj)}
@@ -165,7 +170,7 @@ func (kg *Keygen) finalize(
 	r2Ids []*tss.PartyID, r2msgs []*keygenRound2msg,
 ) {
 	if kg.ctx.Err() != nil {
-		kg.Err <- kg.ctx.Err()
+		sendOnce(&kg.errOnce, kg.Err, kg.ctx.Err())
 		return
 	}
 	g := group.Ristretto255()
@@ -181,12 +186,12 @@ func (kg *Keygen) finalize(
 	for n, pid := range r2Ids {
 		vsj, ok := vsByID[pid.KeyInt().String()]
 		if !ok {
-			kg.Err <- fmt.Errorf("share from party %s had no matching round-1 commitments", pid)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("share from party %s had no matching round-1 commitments", pid))
 			return
 		}
 		shareInt, err := g.DecodeScalar(r2msgs[n].Share)
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s sent invalid share: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent invalid share: %w", pid, err))
 			return
 		}
 		sh := &vssShare{
@@ -195,7 +200,7 @@ func (kg *Keygen) finalize(
 			Share:     shareInt,
 		}
 		if !sh.verify(g, kg.params.Threshold(), vsj) {
-			kg.Err <- fmt.Errorf("VSS share verification failed for party %s", pid)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("VSS share verification failed for party %s", pid))
 			return
 		}
 		xi = modQ.Add(xi, shareInt)
@@ -211,7 +216,7 @@ func (kg *Keygen) finalize(
 		for c := 0; c <= kg.params.Threshold(); c++ {
 			sum, err := Vc[c].Add(vsj[c])
 			if err != nil {
-				kg.Err <- fmt.Errorf("aggregating Vc[%d]: %w", c, err)
+				sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("aggregating Vc[%d]: %w", c, err))
 				return
 			}
 			Vc[c] = sum
@@ -227,7 +232,7 @@ func (kg *Keygen) finalize(
 			z = modQ.Mul(z, kj)
 			next, err := BigXj.Add(Vc[c].ScalarMult(z))
 			if err != nil {
-				kg.Err <- fmt.Errorf("computing BigXj for party %d: %w", j, err)
+				sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("computing BigXj for party %d: %w", j, err))
 				return
 			}
 			BigXj = next
@@ -236,7 +241,7 @@ func (kg *Keygen) finalize(
 	}
 	kg.data.GroupPublicKey = Vc[0]
 	kg.a_i_0 = nil
-	kg.Done <- kg.data
+	sendOnce(&kg.doneOnce, kg.Done, kg.data)
 }
 
 func buildKeygenSession(partyKey *big.Int) []byte {

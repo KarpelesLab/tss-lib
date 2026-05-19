@@ -2,6 +2,7 @@ package dklstss
 
 import (
 	"context"
+	"sync"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -52,6 +53,10 @@ type PresignParty struct {
 
 	Done chan *PresignOutput
 	Err  chan error
+
+	// Once-guards on Done/Err — see once_send.go.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewPresign kicks off broker-driven pre-signing.
@@ -150,12 +155,15 @@ func (pp *PresignParty) round1() error {
 	pp.xRhoShare[pp.myPos] = new(big.Int).Mul(pp.sxBySubsetIdx[pp.myPos], pp.rho_i)
 	pp.xRhoShare[pp.myPos].Mod(pp.xRhoShare[pp.myPos], q)
 
+	// Broadcast K_i (identical bytes for every recipient). Sent as a
+	// single To==nil message rather than N-1 unicasts so a well-behaved
+	// broker enforces "same bytes to every recipient" — matches the
+	// signing-side convention. See signing_party.go round1 for the
+	// equivocation rationale.
 	r1 := &signR1{KiX: pp.K_i.X().Bytes(), KiY: pp.K_i.Y().Bytes()}
-	for _, Pj := range pp.otherSubset {
-		m := tss.JsonWrap(presignTypeR1, r1, Pi, Pj)
-		if err := pp.params.Broker().Receive(m); err != nil {
-			return fmt.Errorf("broker r1→%s: %w", Pj, err)
-		}
+	bcast := tss.JsonWrap(presignTypeR1, r1, Pi, nil)
+	if err := pp.params.Broker().Receive(bcast); err != nil {
+		return fmt.Errorf("broker r1 bcast: %w", err)
 	}
 	rcv := tss.NewJsonExpect[signR1](presignTypeR1, pp.otherSubset, pp.round2)
 	pp.params.Broker().Connect(presignTypeR1, rcv)
@@ -164,7 +172,7 @@ func (pp *PresignParty) round1() error {
 
 func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	if err := pp.ctx.Err(); err != nil {
-		pp.Err <- err
+		sendOnce(&pp.errOnce, pp.Err, err)
 		return
 	}
 	ec := pp.params.EC()
@@ -177,13 +185,13 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 			new(big.Int).SetBytes(msgs[n].KiX),
 			new(big.Int).SetBytes(msgs[n].KiY))
 		if err != nil {
-			pp.Err <- fmt.Errorf("party %s sent invalid K_j: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("party %s sent invalid K_j: %w", pid, err))
 			return
 		}
 		pp.peerK[peerKeyStr(pid)] = Kj
 		Radd, err := R.Add(Kj)
 		if err != nil {
-			pp.Err <- fmt.Errorf("R aggregation: %w", err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("R aggregation: %w", err))
 			return
 		}
 		R = Radd
@@ -191,7 +199,7 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	pp.R = R
 	r := new(big.Int).Mod(R.X(), q)
 	if r.Sign() == 0 {
-		pp.Err <- errors.New("R.X mod q == 0, retry")
+		sendOnce(&pp.errOnce, pp.Err, errors.New("R.X mod q == 0, retry"))
 		return
 	}
 	pp.r = r
@@ -206,7 +214,7 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	for _, Pj := range pp.otherSubset {
 		alicePair := pp.key.OT[pp.indexInFullCommittee(Pj)]
 		if alicePair == nil {
-			pp.Err <- fmt.Errorf("missing OT state with peer %s", Pj)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("missing OT state with peer %s", Pj))
 			return
 		}
 		sidK := signMulSid(pp.ssid, "presign-kxrho", Pi.KeyInt(), Pj.KeyInt())
@@ -214,12 +222,12 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 
 		msgK, stK, err := ole.AliceStep1(sidK, alicePair.AsAlice, pp.k_i)
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-k Alice1 to %s: %w", Pj, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-k Alice1 to %s: %w", Pj, err))
 			return
 		}
 		msgX, stX, err := ole.AliceStep1(sidX, alicePair.AsAlice, pp.sxBySubsetIdx[pp.myPos])
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-x Alice1 to %s: %w", Pj, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-x Alice1 to %s: %w", Pj, err))
 			return
 		}
 		pp.aliceStateK[peerKeyStr(Pj)] = stK
@@ -228,7 +236,7 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 		r2 := &signR2{AliceK: encodeExtendMsg(msgK), AliceX: encodeExtendMsg(msgX)}
 		m := tss.JsonWrap(presignTypeR2, r2, Pi, Pj)
 		if err := pp.params.Broker().Receive(m); err != nil {
-			pp.Err <- fmt.Errorf("broker r2→%s: %w", Pj, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("broker r2→%s: %w", Pj, err))
 			return
 		}
 	}
@@ -238,7 +246,7 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 
 func (pp *PresignParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 	if err := pp.ctx.Err(); err != nil {
-		pp.Err <- err
+		sendOnce(&pp.errOnce, pp.Err, err)
 		return
 	}
 	Pi := pp.params.PartyID()
@@ -248,17 +256,17 @@ func (pp *PresignParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 		r2 := msgs[n]
 		bobPair := pp.key.OT[pp.indexInFullCommittee(pid)]
 		if bobPair == nil {
-			pp.Err <- fmt.Errorf("missing OT state with peer %s", pid)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("missing OT state with peer %s", pid))
 			return
 		}
 		extMsgK, err := decodeExtendMsg(r2.AliceK)
 		if err != nil {
-			pp.Err <- fmt.Errorf("decode Alice k-envelope from %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("decode Alice k-envelope from %s: %w", pid, err))
 			return
 		}
 		extMsgX, err := decodeExtendMsg(r2.AliceX)
 		if err != nil {
-			pp.Err <- fmt.Errorf("decode Alice x-envelope from %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("decode Alice x-envelope from %s: %w", pid, err))
 			return
 		}
 		sidK := signMulSid(pp.ssid, "presign-kxrho", pid.KeyInt(), Pi.KeyInt())
@@ -266,12 +274,12 @@ func (pp *PresignParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 
 		bMsgK, uBK, err := ole.BobStep1(sidK, bobPair.AsBob, pp.rho_i, extMsgK)
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-k Bob1 with %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-k Bob1 with %s: %w", pid, err))
 			return
 		}
 		bMsgX, uBX, err := ole.BobStep1(sidX, bobPair.AsBob, pp.rho_i, extMsgX)
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-x Bob1 with %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-x Bob1 with %s: %w", pid, err))
 			return
 		}
 		pp.kRhoShare[pp.myPos] = addMod(q, pp.kRhoShare[pp.myPos], uBK)
@@ -280,7 +288,7 @@ func (pp *PresignParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 		r3 := &signR3{BobK: encodeBobMsg(bMsgK), BobX: encodeBobMsg(bMsgX)}
 		m := tss.JsonWrap(presignTypeR3, r3, Pi, pid)
 		if err := pp.params.Broker().Receive(m); err != nil {
-			pp.Err <- fmt.Errorf("broker r3→%s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("broker r3→%s: %w", pid, err))
 			return
 		}
 	}
@@ -290,7 +298,7 @@ func (pp *PresignParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 
 func (pp *PresignParty) finalize(otherIds []*tss.PartyID, msgs []*signR3) {
 	if err := pp.ctx.Err(); err != nil {
-		pp.Err <- err
+		sendOnce(&pp.errOnce, pp.Err, err)
 		return
 	}
 	q := pp.params.EC().Params().N
@@ -301,22 +309,22 @@ func (pp *PresignParty) finalize(otherIds []*tss.PartyID, msgs []*signR3) {
 		stX := pp.aliceStateX[peerKeyStr(pid)]
 		bobMsgK, err := decodeBobMsg(r3.BobK)
 		if err != nil {
-			pp.Err <- fmt.Errorf("decode Bob-k from %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("decode Bob-k from %s: %w", pid, err))
 			return
 		}
 		bobMsgX, err := decodeBobMsg(r3.BobX)
 		if err != nil {
-			pp.Err <- fmt.Errorf("decode Bob-x from %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("decode Bob-x from %s: %w", pid, err))
 			return
 		}
 		uAK, err := ole.AliceStep2(stK, bobMsgK)
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-k Alice2 with %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-k Alice2 with %s: %w", pid, err))
 			return
 		}
 		uAX, err := ole.AliceStep2(stX, bobMsgX)
 		if err != nil {
-			pp.Err <- fmt.Errorf("ΠMul-x Alice2 with %s: %w", pid, err)
+			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("ΠMul-x Alice2 with %s: %w", pid, err))
 			return
 		}
 		pp.kRhoShare[pp.myPos] = addMod(q, pp.kRhoShare[pp.myPos], uAK)
@@ -349,7 +357,7 @@ func (pp *PresignParty) finalize(otherIds []*tss.PartyID, msgs []*signR3) {
 		},
 		aggregated: false,
 	}
-	pp.Done <- out
+	sendOnce(&pp.doneOnce, pp.Done, out)
 }
 
 func (pp *PresignParty) indexInFullCommittee(p *tss.PartyID) int {

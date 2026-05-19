@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
@@ -39,6 +40,11 @@ type Resharing struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards on Done/Err so multi-writer error paths cannot block on
+	// the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewResharing starts a FROST(Ed25519) resharing protocol. For old committee
@@ -149,7 +155,7 @@ func (rs *Resharing) setupNewRound1Receiver() {
 
 func (rs *Resharing) round2New(oldIds []*tss.PartyID, r1msgs []*resharingRound1msg) {
 	if rs.ctx.Err() != nil {
-		rs.Err <- rs.ctx.Err()
+		sendOnce(&rs.errOnce, rs.Err, rs.ctx.Err())
 		return
 	}
 	Pi := rs.params.PartyID()
@@ -159,13 +165,13 @@ func (rs *Resharing) round2New(oldIds []*tss.PartyID, r1msgs []*resharingRound1m
 	for n, msg := range r1msgs {
 		candidate, err := frost.DecodeElement(msg.GroupPublicKey)
 		if err != nil {
-			rs.Err <- fmt.Errorf("party %s sent invalid GroupPublicKey: %w", oldIds[n], err)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("party %s sent invalid GroupPublicKey: %w", oldIds[n], err))
 			return
 		}
 		if pub == nil {
 			pub = candidate
 		} else if !pub.Equals(candidate) {
-			rs.Err <- fmt.Errorf("party %s sent inconsistent GroupPublicKey", oldIds[n])
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("party %s sent inconsistent GroupPublicKey", oldIds[n]))
 			return
 		}
 	}
@@ -220,7 +226,7 @@ func (rs *Resharing) setupNewRound3Receiver(oldIds []*tss.PartyID, r1msgs []*res
 
 func (rs *Resharing) round3Old() {
 	if rs.ctx.Err() != nil {
-		rs.Err <- rs.ctx.Err()
+		sendOnce(&rs.errOnce, rs.Err, rs.ctx.Err())
 		return
 	}
 	Pi := rs.params.PartyID()
@@ -271,7 +277,7 @@ func (rs *Resharing) round4New(
 	r3msg2s []*resharingRound3msg2,
 ) {
 	if rs.ctx.Err() != nil {
-		rs.Err <- rs.ctx.Err()
+		sendOnce(&rs.errOnce, rs.Err, rs.ctx.Err())
 		return
 	}
 	Pi := rs.params.PartyID()
@@ -308,17 +314,17 @@ func (rs *Resharing) round4New(
 	for j := 0; j < len(allOldIds); j++ {
 		r1msg, ok := r1ByOldIdx[j]
 		if !ok {
-			rs.Err <- fmt.Errorf("missing round1 message from old party %d", j)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("missing round1 message from old party %d", j))
 			return
 		}
 		r3msg1, ok := r3m1ByOldIdx[j]
 		if !ok {
-			rs.Err <- fmt.Errorf("missing round3-1 message from old party %d", j)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("missing round3-1 message from old party %d", j))
 			return
 		}
 		r3msg2, ok := r3m2ByOldIdx[j]
 		if !ok {
-			rs.Err <- fmt.Errorf("missing round3-2 message from old party %d", j)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("missing round3-2 message from old party %d", j))
 			return
 		}
 
@@ -327,12 +333,12 @@ func (rs *Resharing) round4New(
 		cmtDeCmt := cmts.HashCommitDecommit{C: vCj, D: vDj}
 		ok2, flatVs := cmtDeCmt.DeCommit()
 		if !ok2 || len(flatVs) != (rs.params.NewThreshold()+1)*2 {
-			rs.Err <- fmt.Errorf("decommitment verify failed for old party %d", j)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("decommitment verify failed for old party %d", j))
 			return
 		}
 		vj, err := crypto.UnFlattenECPoints(ec, flatVs)
 		if err != nil {
-			rs.Err <- fmt.Errorf("UnFlattenECPoints old party %d: %w", j, err)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("UnFlattenECPoints old party %d: %w", j, err))
 			return
 		}
 		for idx, v := range vj {
@@ -346,7 +352,7 @@ func (rs *Resharing) round4New(
 			Share:     new(big.Int).SetBytes(r3msg1.Share),
 		}
 		if !sharej.Verify(ec, rs.params.NewThreshold(), vj) {
-			rs.Err <- fmt.Errorf("VSS share verification failed for old party %d", j)
+			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("VSS share verification failed for old party %d", j))
 			return
 		}
 		newXi = new(big.Int).Add(newXi, sharej.Share)
@@ -360,13 +366,13 @@ func (rs *Resharing) round4New(
 		for j := 1; j < len(vjc); j++ {
 			Vc[c], err = Vc[c].Add(vjc[j][c])
 			if err != nil {
-				rs.Err <- fmt.Errorf("Vc[%d].Add: %w", c, err)
+				sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("Vc[%d].Add: %w", c, err))
 				return
 			}
 		}
 	}
 	if !Vc[0].Equals(rs.groupPubKey) {
-		rs.Err <- fmt.Errorf("assertion failed: V_0 != GroupPublicKey")
+		sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("assertion failed: V_0 != GroupPublicKey"))
 		return
 	}
 
@@ -382,7 +388,7 @@ func (rs *Resharing) round4New(
 			z = modQ.Mul(z, kj)
 			newBigXj, err = newBigXj.Add(Vc[c].ScalarMult(z))
 			if err != nil {
-				rs.Err <- fmt.Errorf("computing newBigXj: %w", err)
+				sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("computing newBigXj: %w", err))
 				return
 			}
 		}
@@ -420,26 +426,26 @@ func (rs *Resharing) round4New(
 		otherNewIds = append(otherNewIds, Pj)
 	}
 	if len(otherNewIds) == 0 {
-		rs.Done <- newKey
+		sendOnce(&rs.doneOnce, rs.Done, newKey)
 		return
 	}
 	rcv := tss.NewJsonExpect[resharingRound4msg]("frost:ed25519:reshare:round4", otherNewIds, func(_ []*tss.PartyID, _ []*resharingRound4msg) {
-		rs.Done <- newKey
+		sendOnce(&rs.doneOnce, rs.Done, newKey)
 	})
 	rs.params.Broker().Connect("frost:ed25519:reshare:round4", rcv)
 }
 
 func (rs *Resharing) round5Old() {
 	if rs.ctx.Err() != nil {
-		rs.Err <- rs.ctx.Err()
+		sendOnce(&rs.errOnce, rs.Err, rs.ctx.Err())
 		return
 	}
 	if rs.input != nil {
 		rs.input.Xi.SetInt64(0)
 	}
 	if rs.params.IsNewCommittee() && rs.round5NewKey != nil {
-		rs.Done <- rs.round5NewKey
+		sendOnce(&rs.doneOnce, rs.Done, rs.round5NewKey)
 	} else {
-		rs.Done <- nil
+		sendOnce(&rs.doneOnce, rs.Done, nil)
 	}
 }

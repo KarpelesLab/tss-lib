@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
@@ -67,6 +68,10 @@ type RefreshParty struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards on Done/Err — see once_send.go.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewRefresh kicks off broker-driven proactive refresh for the local
@@ -186,7 +191,7 @@ func (rp *RefreshParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*refreshR1Un
 // startEchoPhase: see keygen_party.go.
 func (rp *RefreshParty) startEchoPhase(otherIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	digests := make(map[string][]byte, len(otherIds))
@@ -198,7 +203,7 @@ func (rp *RefreshParty) startEchoPhase(otherIds []*tss.PartyID) {
 	out := &echoMsg{Digests: digests}
 	m := tss.JsonWrap(refreshTypeEcho, out, Pi, nil)
 	if err := rp.params.Broker().Receive(m); err != nil {
-		rp.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("broker echo broadcast: %w", err))
 		return
 	}
 	rcv := tss.NewJsonExpect[echoMsg](refreshTypeEcho, otherIds, rp.onEcho)
@@ -208,7 +213,7 @@ func (rp *RefreshParty) startEchoPhase(otherIds []*tss.PartyID) {
 // onEcho: see keygen_party.go.
 func (rp *RefreshParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -222,7 +227,7 @@ func (rp *RefreshParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 
 	all := append([]*tss.PartyID{Pi}, otherIds...)
 	if err := verifyEchoes(myDigests, selfKey, otherIds, msgs, all, echoSourceRefresh); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	rp.r1Echoes = msgs
@@ -231,7 +236,7 @@ func (rp *RefreshParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 
 func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -245,38 +250,38 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 		bc := bcasts[n]
 		uc := ucs[n]
 		if len(bc.VSSCommitments) != 2*threshold {
-			rp.Err <- fmt.Errorf("party %s sent %d Vs coords, expected %d",
-				pid, len(bc.VSSCommitments), 2*threshold)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s sent %d Vs coords, expected %d",
+				pid, len(bc.VSSCommitments), 2*threshold))
 			return
 		}
 		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s Vs decode: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s Vs decode: %w", pid, err))
 			return
 		}
 		shareInt := new(big.Int).SetBytes(uc.Share)
 		// Reject non-canonical (>= q) shares — see keygen_party round2
 		// for the rationale (echo-bypass via non-canonical bytes).
 		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
-			rp.Err <- fmt.Errorf("party %s sent non-canonical refresh-share (>= q)", pid)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s sent non-canonical refresh-share (>= q)", pid))
 			return
 		}
 		if !verifyZeroConstShare(vsj, Pi.KeyInt(), shareInt) {
-			rp.Err <- fmt.Errorf("party %s refresh-share verification failed", pid)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s refresh-share verification failed", pid))
 			return
 		}
 		Sj, err := crypto.NewECPoint(ec,
 			new(big.Int).SetBytes(uc.OTSenderSX),
 			new(big.Int).SetBytes(uc.OTSenderSY))
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s OT-S invalid: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s OT-S invalid: %w", pid, err))
 			return
 		}
 		alpha, err := crypto.NewECPoint(ec,
 			new(big.Int).SetBytes(uc.OTSenderPokAX),
 			new(big.Int).SetBytes(uc.OTSenderPokAY))
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s OT-PoK-alpha invalid: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s OT-PoK-alpha invalid: %w", pid, err))
 			return
 		}
 		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(uc.OTSenderPokT)}
@@ -285,12 +290,12 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 
 		delta := make([]byte, otext.DeltaBytes)
 		if _, err := rp.params.Rand().Read(delta); err != nil {
-			rp.Err <- fmt.Errorf("rand: %w", err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("rand: %w", err))
 			return
 		}
 		rcvr, rcvMsg, err := baseot.NewReceiver(sid, otext.Kappa, delta, sndMsg, rp.params.Rand())
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s base-OT receiver: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s base-OT receiver: %w", pid, err))
 			return
 		}
 		rp.baseRcv[peerKeyStr(pid)] = rcvr
@@ -301,7 +306,7 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 		r2 := &keygenR2{OTReceiverR: flattenPointXY(rcvMsg.R)}
 		m := tss.JsonWrap(refreshTypeR2, r2, Pi, pid)
 		if err := rp.params.Broker().Receive(m); err != nil {
-			rp.Err <- fmt.Errorf("broker r2→%s: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("broker r2→%s: %w", pid, err))
 			return
 		}
 	}
@@ -311,7 +316,7 @@ func (rp *RefreshParty) round2(otherIds []*tss.PartyID) {
 
 func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -343,12 +348,12 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		// Compute delta_j · G via commitments.
 		deltaG, err := evalCommitmentSumZeroConst(rp.vsSelf, rp.peerVs, pj.KeyInt())
 		if err != nil {
-			rp.Err <- fmt.Errorf("delta·G[%d]: %w", pj.Index, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("delta·G[%d]: %w", pj.Index, err))
 			return
 		}
 		newPoint, err := rp.old.BigXj[pj.Index].Add(deltaG)
 		if err != nil {
-			rp.Err <- fmt.Errorf("new BigXj[%d]: %w", pj.Index, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("new BigXj[%d]: %w", pj.Index, err))
 			return
 		}
 		newBigXj[pj.Index] = newPoint
@@ -357,7 +362,7 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 	// Sanity: newXi · G == newBigXj[Pi.Index].
 	expect := crypto.ScalarBaseMult(ec, newXi)
 	if !expect.Equals(newBigXj[Pi.Index]) {
-		rp.Err <- errors.New("refresh consistency check failed: newXi·G != newBigXj[self]")
+		sendOnce(&rp.errOnce, rp.Err, errors.New("refresh consistency check failed: newXi·G != newBigXj[self]"))
 		return
 	}
 
@@ -367,12 +372,12 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		peerk := peerKeyStr(pj)
 		chosen, err := rp.baseRcv[peerk].Finalize()
 		if err != nil {
-			rp.Err <- fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err))
 			return
 		}
 		extSender, err := otext.NewExtSenderFromBase(rp.myDelta[peerk], chosen)
 		if err != nil {
-			rp.Err <- fmt.Errorf("ExtSender for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("ExtSender for %s: %w", pj, err))
 			return
 		}
 		var r2 *keygenR2
@@ -383,22 +388,22 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 			}
 		}
 		if r2 == nil {
-			rp.Err <- fmt.Errorf("missing r2 from %s", pj)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("missing r2 from %s", pj))
 			return
 		}
 		rPoints, err := unflattenPointXY(ec, r2.OTReceiverR)
 		if err != nil {
-			rp.Err <- fmt.Errorf("decode R from %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("decode R from %s: %w", pj, err))
 			return
 		}
 		k0, k1, err := rp.baseSnd[peerk].Finalize(&baseot.ReceiverMsg1{R: rPoints})
 		if err != nil {
-			rp.Err <- fmt.Errorf("base-OT sender finalize for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("base-OT sender finalize for %s: %w", pj, err))
 			return
 		}
 		extReceiver, err := otext.NewExtReceiverFromBase(k0, k1)
 		if err != nil {
-			rp.Err <- fmt.Errorf("ExtReceiver for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("ExtReceiver for %s: %w", pj, err))
 			return
 		}
 		ot[pj.Index] = &PairOTState{AsAlice: extReceiver, AsBob: extSender}
@@ -417,10 +422,10 @@ func (rp *RefreshParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		ChainCode: append([]byte(nil), rp.old.ChainCode...),
 	}
 	if err := newKey.ValidateBasic(); err != nil {
-		rp.Err <- fmt.Errorf("refresh finalize ValidateBasic: %w", err)
+		sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("refresh finalize ValidateBasic: %w", err))
 		return
 	}
-	rp.Done <- newKey
+	sendOnce(&rp.doneOnce, rp.Done, newKey)
 }
 
 // evalCommitmentSumZeroConst computes Σ_i (f_i(id_j) · G) where each
@@ -444,8 +449,20 @@ func evalCommitmentSumZeroConst(vsSelf []*crypto.ECPoint, peerVs map[string][]*c
 
 	eval := func(Vs []*crypto.ECPoint) (*crypto.ECPoint, error) {
 		idPow := new(big.Int).Mod(id, q)
+		if idPow.Sign() == 0 {
+			return nil, errors.New("id ≡ 0 mod q (invalid party identifier)")
+		}
 		var acc *crypto.ECPoint
 		for k, V := range Vs {
+			if !V.ValidateBasic() {
+				// Defense-in-depth: ECPoint.ScalarMult panics on input
+				// points whose internal state is malformed (nil coords,
+				// off-curve). Honest peers' commitments come from
+				// unflattenPointXY which uses NewECPoint and guards
+				// against this; the explicit reject here makes the
+				// contract local and survives future refactors.
+				return nil, fmt.Errorf("Vs[%d] is not a valid curve point", k)
+			}
 			term := V.ScalarMult(idPow)
 			if acc == nil {
 				acc = term

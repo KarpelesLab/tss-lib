@@ -31,21 +31,35 @@ func bigIntToEncodedBytes(a *big.Int) *[32]byte {
 	return s
 }
 
+// copyBytes copies a big-endian byte slice into a fixed-width 32-byte
+// buffer, left-padding with zeros if the input is shorter than 32 bytes
+// and taking the low 32 bytes (mathematically: mod 2^256) if longer.
+//
+// The previous implementation silently took the HIGH 32 bytes for inputs
+// longer than 32 bytes, which is the wrong end of a big-endian
+// representation — it discarded the low bits, which for an attacker-
+// controlled `*big.Int` produced by `new(big.Int).SetBytes(msg.Si)` (a
+// peer's wire-format reply) meant a malicious peer could swap which
+// bytes of their declared Si end up in the computation. In honest
+// callers nothing exceeds 32 bytes (Ed25519 scalars are < 2^253), so
+// the new mod-2^256 behaviour leaves the honest path unchanged.
 func copyBytes(aB []byte) *[32]byte {
 	if aB == nil {
 		return nil
 	}
 	s := new([32]byte)
-	// If we have a short byte string, expand it so that it's long enough.
 	aBLen := len(aB)
-	if aBLen < 32 {
-		diff := 32 - aBLen
-		for i := 0; i < diff; i++ {
-			aB = append([]byte{0x00}, aB...)
-		}
+	if aBLen > 32 {
+		// Take the LOW 32 bytes (i.e., mod 2^256). For a big-endian
+		// input, that's the trailing 32 bytes, NOT the leading ones.
+		aB = aB[aBLen-32:]
+		aBLen = 32
 	}
-	for i := 0; i < 32; i++ {
-		s[i] = aB[i]
+	// Left-pad short inputs with zero bytes so the value is right-aligned
+	// in the output buffer.
+	pad := 32 - aBLen
+	for i := 0; i < aBLen; i++ {
+		s[pad+i] = aB[i]
 	}
 	return s
 }

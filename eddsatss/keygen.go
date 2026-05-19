@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
@@ -30,6 +31,11 @@ type Keygen struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards on Done/Err so multi-writer error paths cannot block on
+	// the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewKeygen creates a new Keygen instance and kicks off round 1 of the EdDSA key generation protocol.
@@ -124,14 +130,16 @@ func (kg *Keygen) round1() error {
 		otherIds = append(otherIds, p)
 	}
 
-	// broadcast round 1 message: commitment
+	// Broadcast round 1 commitment via a single To==nil message.
+	// Identical bytes for every recipient; a well-behaved broker enforces
+	// that contract for broadcasts and the alternative N-1 unicasts gave
+	// a malicious dealer the option to ship divergent commitments. The
+	// round-2 decommit + Schnorr PoK then enforces consistency.
 	msg := &keygenRound1msg{
 		Commitment: cmt.C.Bytes(),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("eddsa:keygen:round1", msg, Pi, p)
-		kg.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("eddsa:keygen:round1", msg, Pi, nil)
+	kg.params.Broker().Receive(m)
 
 	// register receiver for round 1 messages from others -> triggers round 2
 	rcv := tss.NewJsonExpect[keygenRound1msg]("eddsa:keygen:round1", otherIds, kg.round2)
@@ -142,7 +150,7 @@ func (kg *Keygen) round1() error {
 
 func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	if kg.ctx.Err() != nil {
-		kg.Err <- kg.ctx.Err()
+		sendOnce(&kg.errOnce, kg.Err, kg.ctx.Err())
 		return
 	}
 	Pi := kg.params.PartyID()
@@ -170,7 +178,7 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 			}
 		}
 		if shareForPj == nil {
-			kg.Err <- fmt.Errorf("could not find share for party %s", Pj)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("could not find share for party %s", Pj))
 			return
 		}
 		r2msg1 := &keygenRound2msg1{
@@ -184,21 +192,22 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	ContextI := append(kg.ssid, new(big.Int).SetUint64(uint64(i)).Bytes()...)
 	pii, err := schnorr.NewZKProof(ContextI, kg.ui, kg.vs[0], kg.params.Rand())
 	if err != nil {
-		kg.Err <- fmt.Errorf("NewZKProof(ui, vi0): %w", err)
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("NewZKProof(ui, vi0): %w", err))
 		return
 	}
 
-	// broadcast decommitment + Schnorr proof
+	// Broadcast decommitment + Schnorr proof via a single To==nil
+	// message — the payload is identical for every recipient, so a true
+	// broadcast lets a well-behaved broker enforce that contract rather
+	// than relying on N-1 unicasts.
 	r2msg2 := &keygenRound2msg2{
 		DeCommitment:       common.BigIntsToBytes(kg.deCommitPolyG),
 		SchnorrProofAlphaX: pii.Alpha.X().Bytes(),
 		SchnorrProofAlphaY: pii.Alpha.Y().Bytes(),
 		SchnorrProofT:      pii.T.Bytes(),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("eddsa:keygen:round2-2", r2msg2, Pi, p)
-		kg.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("eddsa:keygen:round2-2", r2msg2, Pi, nil)
+	kg.params.Broker().Receive(m)
 
 	// security: now we can discard ui
 	kg.ui = nil
@@ -230,7 +239,7 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 
 func (kg *Keygen) processRound3(otherIds []*tss.PartyID, r2msg1s []*keygenRound2msg1, r2msg2s []*keygenRound2msg2) {
 	if kg.ctx.Err() != nil {
-		kg.Err <- kg.ctx.Err()
+		sendOnce(&kg.errOnce, kg.Err, kg.ctx.Err())
 		return
 	}
 	ec := kg.params.EC()
@@ -324,7 +333,7 @@ func (kg *Keygen) processRound3(otherIds []*tss.PartyID, r2msg1s []*keygenRound2
 	for n := range otherIds {
 		vssResults[n] = <-chs[n]
 		if vssResults[n].err != nil {
-			kg.Err <- vssResults[n].err
+			sendOnce(&kg.errOnce, kg.Err, vssResults[n].err)
 			return
 		}
 	}
@@ -348,7 +357,7 @@ func (kg *Keygen) processRound3(otherIds []*tss.PartyID, r2msg1s []*keygenRound2
 			var err error
 			Vc[c], err = Vc[c].Add(PjVs[c])
 			if err != nil {
-				kg.Err <- fmt.Errorf("adding PjVs[c] to Vc[c] failed: %w", err)
+				sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("adding PjVs[c] to Vc[c] failed: %w", err))
 				return
 			}
 		}
@@ -365,7 +374,7 @@ func (kg *Keygen) processRound3(otherIds []*tss.PartyID, r2msg1s []*keygenRound2
 			var err error
 			BigXj, err = BigXj.Add(Vc[c].ScalarMult(z))
 			if err != nil {
-				kg.Err <- fmt.Errorf("computing BigXj failed: %w", err)
+				sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("computing BigXj failed: %w", err))
 				return
 			}
 		}
@@ -375,10 +384,10 @@ func (kg *Keygen) processRound3(otherIds []*tss.PartyID, r2msg1s []*keygenRound2
 	// EDDSAPub = Vc[0]
 	eddsaPubKey, err := crypto.NewECPoint(ec, Vc[0].X(), Vc[0].Y())
 	if err != nil {
-		kg.Err <- fmt.Errorf("public key is not on the curve: %w", err)
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("public key is not on the curve: %w", err))
 		return
 	}
 	kg.data.EDDSAPub = eddsaPubKey
 
-	kg.Done <- kg.data
+	sendOnce(&kg.doneOnce, kg.Done, kg.data)
 }
