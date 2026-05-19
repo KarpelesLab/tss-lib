@@ -28,7 +28,9 @@ import (
 // and causing an `index out of range` panic in finalize.
 //
 // This test forces the interleaved case with the keyset
-//   OLD = {10, 20, 30}, NEW = {15, 25, 35}
+//
+//	OLD = {10, 20, 30}, NEW = {15, 25, 35}
+//
 // whose combined sort is [10, 15, 20, 25, 30, 35], placing every NEW
 // party's combined-context Index at 1, 3, or 5 — all >= len(newSubset)=3.
 // Under the previous code the test panicked; with the fix it completes.
