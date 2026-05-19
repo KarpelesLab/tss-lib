@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 
+	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/secp256k1"
 
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -38,6 +39,15 @@ func ScalarMultWithRand(P *crypto.ECPoint, k *big.Int, rng io.Reader) *crypto.EC
 	if P == nil || k == nil {
 		return nil
 	}
+	// Ed25519: no per-point CT scalar-mult helper is provided by the
+	// upstream edwards25519 package (it exposes a CT fixed-base
+	// GeScalarMultBase but not a general CT variable-base mult). Fall
+	// back to the (non-CT) ECPoint.ScalarMult so the function remains
+	// total — callers that need CT-variable-base on Ed25519 must
+	// either compose from CT primitives themselves or accept that the
+	// non-CT path is what's available. The Schnorr ZKProof construction
+	// only uses base-mult (covered above by ScalarBaseMultWithRand),
+	// so this path is exercised only by the rarer ZKVProof.
 	if P.Curve() != secp256k1.S256() {
 		return P.ScalarMult(k)
 	}
@@ -58,7 +68,18 @@ func ScalarBaseMult(curve elliptic.Curve, k *big.Int) *crypto.ECPoint {
 }
 
 // ScalarBaseMultWithRand is ScalarBaseMult with an explicit random source.
+//
+// Curve dispatch:
+//   - secp256k1 → constant-time Montgomery ladder (this file).
+//   - Ed25519   → crypto.CTScalarBaseMultEd25519 (edwards25519 fixed-base
+//     table). Does not consume `rng` (the underlying primitive's CT
+//     guarantee does not depend on per-call randomness).
+//   - other     → falls back to the non-CT crypto.ScalarBaseMult so the
+//     function remains total. Documented in the package doc.
 func ScalarBaseMultWithRand(curve elliptic.Curve, k *big.Int, rng io.Reader) *crypto.ECPoint {
+	if curve == edwards25519.Edwards() {
+		return crypto.CTScalarBaseMultEd25519(curve, k)
+	}
 	if curve != secp256k1.S256() {
 		return crypto.ScalarBaseMult(curve, k)
 	}
