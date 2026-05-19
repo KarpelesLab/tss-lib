@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
@@ -67,6 +68,12 @@ type KeygenParty struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards so multi-writer error paths (ctx cancellation observed
+	// in nested callbacks, duplicate broker deliveries, etc.) cannot
+	// block on the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewKeygen kicks off DKG for the local party. Returns immediately;
@@ -204,7 +211,7 @@ func (kg *KeygenParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*keygenR1Unic
 // every other party. See echo.go for the rationale.
 func (kg *KeygenParty) startEchoPhase(otherIds []*tss.PartyID) {
 	if err := kg.ctx.Err(); err != nil {
-		kg.Err <- err
+		sendOnce(&kg.errOnce, kg.Err, err)
 		return
 	}
 	digests := make(map[string][]byte, len(otherIds))
@@ -216,7 +223,7 @@ func (kg *KeygenParty) startEchoPhase(otherIds []*tss.PartyID) {
 	out := &echoMsg{Digests: digests}
 	m := tss.JsonWrap(keygenTypeEcho, out, Pi, nil)
 	if err := kg.params.Broker().Receive(m); err != nil {
-		kg.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("broker echo broadcast: %w", err))
 		return
 	}
 	rcv := tss.NewJsonExpect[echoMsg](keygenTypeEcho, otherIds, kg.onEcho)
@@ -230,7 +237,7 @@ func (kg *KeygenParty) startEchoPhase(otherIds []*tss.PartyID) {
 // commitments).
 func (kg *KeygenParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 	if err := kg.ctx.Err(); err != nil {
-		kg.Err <- err
+		sendOnce(&kg.errOnce, kg.Err, err)
 		return
 	}
 	Pi := kg.params.PartyID()
@@ -246,7 +253,7 @@ func (kg *KeygenParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 
 	all := append([]*tss.PartyID{Pi}, otherIds...)
 	if err := verifyEchoes(myDigests, selfKey, otherIds, msgs, all, echoSourceKeygen); err != nil {
-		kg.Err <- err
+		sendOnce(&kg.errOnce, kg.Err, err)
 		return
 	}
 	kg.r1Echoes = msgs
@@ -255,7 +262,7 @@ func (kg *KeygenParty) onEcho(otherIds []*tss.PartyID, msgs []*echoMsg) {
 
 func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 	if err := kg.ctx.Err(); err != nil {
-		kg.Err <- err
+		sendOnce(&kg.errOnce, kg.Err, err)
 		return
 	}
 	Pi := kg.params.PartyID()
@@ -270,13 +277,13 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 		uc := ucs[n]
 
 		if len(bc.VSSCommitments) != 2*(threshold+1) {
-			kg.Err <- fmt.Errorf("party %s sent %d VSS-commitment coords, expected %d",
-				pid, len(bc.VSSCommitments), 2*(threshold+1))
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent %d VSS-commitment coords, expected %d",
+				pid, len(bc.VSSCommitments), 2*(threshold+1)))
 			return
 		}
 		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s VSS commitments decode: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s VSS commitments decode: %w", pid, err))
 			return
 		}
 
@@ -291,12 +298,12 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 		// while still verifying — an echo-bypass channel. Reject `>= q`
 		// outright; only the canonical `[0, q)` encoding is permitted.
 		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
-			kg.Err <- fmt.Errorf("party %s sent non-canonical share (>= q)", pid)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s sent non-canonical share (>= q)", pid))
 			return
 		}
 		sh := &vss.Share{Threshold: threshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, threshold, vsj) {
-			kg.Err <- fmt.Errorf("party %s VSS share verification failed", pid)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s VSS share verification failed", pid))
 			return
 		}
 
@@ -304,14 +311,14 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 			new(big.Int).SetBytes(uc.OTSenderSX),
 			new(big.Int).SetBytes(uc.OTSenderSY))
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s OT Sender S invalid: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s OT Sender S invalid: %w", pid, err))
 			return
 		}
 		alpha, err := crypto.NewECPoint(ec,
 			new(big.Int).SetBytes(uc.OTSenderPokAX),
 			new(big.Int).SetBytes(uc.OTSenderPokAY))
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s OT Sender PoK alpha invalid: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s OT Sender PoK alpha invalid: %w", pid, err))
 			return
 		}
 		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(uc.OTSenderPokT)}
@@ -322,12 +329,12 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 
 		delta := make([]byte, otext.DeltaBytes)
 		if _, err := kg.params.Rand().Read(delta); err != nil {
-			kg.Err <- fmt.Errorf("randomness: %w", err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("randomness: %w", err))
 			return
 		}
 		rcvr, rcvMsg, err := baseot.NewReceiver(sid, otext.Kappa, delta, sndMsg, kg.params.Rand())
 		if err != nil {
-			kg.Err <- fmt.Errorf("party %s base-OT receiver setup: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s base-OT receiver setup: %w", pid, err))
 			return
 		}
 		kg.baseRcv[peerKeyStr(pid)] = rcvr
@@ -338,7 +345,7 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 		r2 := &keygenR2{OTReceiverR: flattenPointXY(rcvMsg.R)}
 		m := tss.JsonWrap(keygenTypeR2, r2, Pi, pid)
 		if err := kg.params.Broker().Receive(m); err != nil {
-			kg.Err <- fmt.Errorf("broker.Receive r2→%s: %w", pid, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("broker.Receive r2→%s: %w", pid, err))
 			return
 		}
 	}
@@ -349,7 +356,7 @@ func (kg *KeygenParty) round2(otherIds []*tss.PartyID) {
 
 func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 	if err := kg.ctx.Err(); err != nil {
-		kg.Err <- err
+		sendOnce(&kg.errOnce, kg.Err, err)
 		return
 	}
 	Pi := kg.params.PartyID()
@@ -371,7 +378,7 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		var err error
 		pub, err = pub.Add(kg.peerVs[peerKeyStr(pid)][0])
 		if err != nil {
-			kg.Err <- fmt.Errorf("aggregate pubkey: %w", err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("aggregate pubkey: %w", err))
 			return
 		}
 	}
@@ -388,7 +395,7 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 	for _, pid := range parties {
 		Xj, err := evaluateCommitmentSum(ec, allVss, pid.KeyInt())
 		if err != nil {
-			kg.Err <- fmt.Errorf("BigXj[%d]: %w", pid.Index, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("BigXj[%d]: %w", pid.Index, err))
 			return
 		}
 		BigXj[pid.Index] = Xj
@@ -401,12 +408,12 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		// Direction "i is ExtSender": local base-OT Receiver finalizes.
 		chosen, err := kg.baseRcv[peerk].Finalize()
 		if err != nil {
-			kg.Err <- fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err))
 			return
 		}
 		extSender, err := otext.NewExtSenderFromBase(kg.myDelta[peerk], chosen)
 		if err != nil {
-			kg.Err <- fmt.Errorf("ExtSender for %s: %w", pj, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("ExtSender for %s: %w", pj, err))
 			return
 		}
 
@@ -420,22 +427,22 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 			}
 		}
 		if r2 == nil {
-			kg.Err <- fmt.Errorf("missing round-2 message from %s", pj)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("missing round-2 message from %s", pj))
 			return
 		}
 		rPoints, err := unflattenPointXY(ec, r2.OTReceiverR)
 		if err != nil {
-			kg.Err <- fmt.Errorf("decode R from %s: %w", pj, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("decode R from %s: %w", pj, err))
 			return
 		}
 		k0, k1, err := kg.baseSnd[peerk].Finalize(&baseot.ReceiverMsg1{R: rPoints})
 		if err != nil {
-			kg.Err <- fmt.Errorf("base-OT sender finalize for %s: %w", pj, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("base-OT sender finalize for %s: %w", pj, err))
 			return
 		}
 		extReceiver, err := otext.NewExtReceiverFromBase(k0, k1)
 		if err != nil {
-			kg.Err <- fmt.Errorf("ExtReceiver for %s: %w", pj, err)
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("ExtReceiver for %s: %w", pj, err))
 			return
 		}
 
@@ -456,10 +463,10 @@ func (kg *KeygenParty) finalize(otherIds []*tss.PartyID, msgs []*keygenR2) {
 		ChainCode: chainCode,
 	}
 	if err := key.ValidateBasic(); err != nil {
-		kg.Err <- fmt.Errorf("finalize ValidateBasic: %w", err)
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("finalize ValidateBasic: %w", err))
 		return
 	}
-	kg.Done <- key
+	sendOnce(&kg.doneOnce, kg.Done, key)
 }
 
 // --- wire types ----------------------------------------------------

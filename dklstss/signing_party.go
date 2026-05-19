@@ -2,6 +2,7 @@ package dklstss
 
 import (
 	"context"
+	"sync"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -73,6 +74,10 @@ type SigningParty struct {
 
 	Done chan *Signature
 	Err  chan error
+
+	// Once-guards on Done/Err — see once_send.go.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewSigning kicks off broker-driven signing for the local party. The
@@ -198,13 +203,28 @@ func (sp *SigningParty) round1() error {
 	sp.xRhoShare[sp.myPos] = new(big.Int).Mul(sp.sxBySubsetIdx[sp.myPos], sp.rho_i)
 	sp.xRhoShare[sp.myPos].Mod(sp.xRhoShare[sp.myPos], q)
 
-	// Broadcast K_i to every peer in the subset.
+	// Broadcast K_i to every peer in the subset via a single To==nil
+	// message rather than N-1 unicasts. K_i has identical bytes for
+	// every recipient by construction (it's the same point); sending
+	// it as a broadcast lets a well-behaved broker enforce the "same
+	// bytes to every recipient" contract that prevents equivocation
+	// (a malicious party sending K_i_A to A and K_i_B to B). Matches
+	// the broadcast convention already used in keygen / refresh /
+	// resharing round 1 for the same reason.
+	//
+	// NOTE: a malicious BROKER could still equivocate by re-wrapping
+	// the broadcast as different per-recipient unicasts. A defense-in-
+	// depth echo-cross-check (each peer broadcasts a digest of every
+	// K_j received and they're cross-verified) would close that gap;
+	// see echo.go for the keygen analogue. For signing/presigning the
+	// equivocation is currently caught downstream as an opaque ΠMul
+	// failure (the mixed ssid diverges between Alice and Bob), so the
+	// security goal holds but identifiable abort does not. The echo
+	// extension is tracked separately.
 	r1 := &signR1{KiX: sp.K_i.X().Bytes(), KiY: sp.K_i.Y().Bytes()}
-	for _, Pj := range sp.otherSubset {
-		m := tss.JsonWrap(signTypeR1, r1, Pi, Pj)
-		if err := sp.params.Broker().Receive(m); err != nil {
-			return fmt.Errorf("broker r1→%s: %w", Pj, err)
-		}
+	bcast := tss.JsonWrap(signTypeR1, r1, Pi, nil)
+	if err := sp.params.Broker().Receive(bcast); err != nil {
+		return fmt.Errorf("broker r1 bcast: %w", err)
 	}
 	rcv := tss.NewJsonExpect[signR1](signTypeR1, sp.otherSubset, sp.round2)
 	sp.params.Broker().Connect(signTypeR1, rcv)
@@ -213,7 +233,7 @@ func (sp *SigningParty) round1() error {
 
 func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 	if err := sp.ctx.Err(); err != nil {
-		sp.Err <- err
+		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	ec := sp.params.EC()
@@ -227,20 +247,20 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 			new(big.Int).SetBytes(msgs[n].KiX),
 			new(big.Int).SetBytes(msgs[n].KiY))
 		if err != nil {
-			sp.Err <- fmt.Errorf("party %s sent invalid K_j: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("party %s sent invalid K_j: %w", pid, err))
 			return
 		}
 		sp.peerK[peerKeyStr(pid)] = Kj
 		Radd, err := R.Add(Kj)
 		if err != nil {
-			sp.Err <- fmt.Errorf("R aggregation: %w", err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("R aggregation: %w", err))
 			return
 		}
 		R = Radd
 	}
 	r := new(big.Int).Mod(R.X(), q)
 	if r.Sign() == 0 {
-		sp.Err <- errors.New("R.X mod q == 0, retry with fresh randomness")
+		sendOnce(&sp.errOnce, sp.Err, errors.New("R.X mod q == 0, retry with fresh randomness"))
 		return
 	}
 	sp.r = r
@@ -264,7 +284,7 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 		// Find Bob's per-pair OT-extension-receiver state on Alice's side.
 		alicePair := sp.key.OT[sp.indexInFullCommittee(Pj)]
 		if alicePair == nil {
-			sp.Err <- fmt.Errorf("missing OT state with peer %s", Pj)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("missing OT state with peer %s", Pj))
 			return
 		}
 		sidK := signMulSid(sp.ssid, "kxrho", Pi.KeyInt(), Pj.KeyInt())
@@ -272,12 +292,12 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 
 		msgK, stK, err := ole.AliceStep1(sidK, alicePair.AsAlice, sp.k_i)
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-k Alice1 to %s: %w", Pj, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-k Alice1 to %s: %w", Pj, err))
 			return
 		}
 		msgX, stX, err := ole.AliceStep1(sidX, alicePair.AsAlice, sp.sxBySubsetIdx[sp.myPos])
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-x Alice1 to %s: %w", Pj, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-x Alice1 to %s: %w", Pj, err))
 			return
 		}
 		sp.aliceStateK[peerKeyStr(Pj)] = stK
@@ -289,7 +309,7 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 		}
 		m := tss.JsonWrap(signTypeR2, r2, Pi, Pj)
 		if err := sp.params.Broker().Receive(m); err != nil {
-			sp.Err <- fmt.Errorf("broker r2→%s: %w", Pj, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r2→%s: %w", Pj, err))
 			return
 		}
 	}
@@ -300,7 +320,7 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 
 func (sp *SigningParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 	if err := sp.ctx.Err(); err != nil {
-		sp.Err <- err
+		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	Pi := sp.params.PartyID()
@@ -312,17 +332,17 @@ func (sp *SigningParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 		r2 := msgs[n]
 		bobPair := sp.key.OT[sp.indexInFullCommittee(pid)]
 		if bobPair == nil {
-			sp.Err <- fmt.Errorf("missing OT state with peer %s", pid)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("missing OT state with peer %s", pid))
 			return
 		}
 		extMsgK, err := decodeExtendMsg(r2.AliceK)
 		if err != nil {
-			sp.Err <- fmt.Errorf("decode Alice k-envelope from %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("decode Alice k-envelope from %s: %w", pid, err))
 			return
 		}
 		extMsgX, err := decodeExtendMsg(r2.AliceX)
 		if err != nil {
-			sp.Err <- fmt.Errorf("decode Alice x-envelope from %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("decode Alice x-envelope from %s: %w", pid, err))
 			return
 		}
 		// peer's sid bound to peer-as-Alice
@@ -331,12 +351,12 @@ func (sp *SigningParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 
 		bMsgK, uBK, err := ole.BobStep1(sidK, bobPair.AsBob, sp.rho_i, extMsgK)
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-k Bob1 with %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-k Bob1 with %s: %w", pid, err))
 			return
 		}
 		bMsgX, uBX, err := ole.BobStep1(sidX, bobPair.AsBob, sp.rho_i, extMsgX)
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-x Bob1 with %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-x Bob1 with %s: %w", pid, err))
 			return
 		}
 
@@ -351,7 +371,7 @@ func (sp *SigningParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 		}
 		m := tss.JsonWrap(signTypeR3, r3, Pi, pid)
 		if err := sp.params.Broker().Receive(m); err != nil {
-			sp.Err <- fmt.Errorf("broker r3→%s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r3→%s: %w", pid, err))
 			return
 		}
 	}
@@ -362,7 +382,7 @@ func (sp *SigningParty) round3(otherIds []*tss.PartyID, msgs []*signR2) {
 
 func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 	if err := sp.ctx.Err(); err != nil {
-		sp.Err <- err
+		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	Pi := sp.params.PartyID()
@@ -375,27 +395,27 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 		stK := sp.aliceStateK[peerKeyStr(pid)]
 		stX := sp.aliceStateX[peerKeyStr(pid)]
 		if stK == nil || stX == nil {
-			sp.Err <- fmt.Errorf("missing Alice state for peer %s", pid)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("missing Alice state for peer %s", pid))
 			return
 		}
 		bobMsgK, err := decodeBobMsg(r3.BobK)
 		if err != nil {
-			sp.Err <- fmt.Errorf("decode Bob-k from %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("decode Bob-k from %s: %w", pid, err))
 			return
 		}
 		bobMsgX, err := decodeBobMsg(r3.BobX)
 		if err != nil {
-			sp.Err <- fmt.Errorf("decode Bob-x from %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("decode Bob-x from %s: %w", pid, err))
 			return
 		}
 		uAK, err := ole.AliceStep2(stK, bobMsgK)
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-k Alice2 with %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-k Alice2 with %s: %w", pid, err))
 			return
 		}
 		uAX, err := ole.AliceStep2(stX, bobMsgX)
 		if err != nil {
-			sp.Err <- fmt.Errorf("ΠMul-x Alice2 with %s: %w", pid, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("ΠMul-x Alice2 with %s: %w", pid, err))
 			return
 		}
 		sp.kRhoShare[sp.myPos] = addMod(q, sp.kRhoShare[sp.myPos], uAK)
@@ -421,7 +441,7 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 	for _, Pj := range sp.otherSubset {
 		m := tss.JsonWrap(signTypeR4, r4, Pi, Pj)
 		if err := sp.params.Broker().Receive(m); err != nil {
-			sp.Err <- fmt.Errorf("broker r4→%s: %w", Pj, err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4→%s: %w", Pj, err))
 			return
 		}
 	}
@@ -431,7 +451,7 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 
 func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
 	if err := sp.ctx.Err(); err != nil {
-		sp.Err <- err
+		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	q := sp.params.EC().Params().N
@@ -446,18 +466,18 @@ func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
 		shat.Mod(shat, q)
 	}
 	if phi.Sign() == 0 {
-		sp.Err <- errors.New("φ aggregated to 0; retry signing with fresh randomness")
+		sendOnce(&sp.errOnce, sp.Err, errors.New("φ aggregated to 0; retry signing with fresh randomness"))
 		return
 	}
 	phiInv := common.ModInt(q).ModInverse(phi)
 	if phiInv == nil {
-		sp.Err <- errors.New("φ has no inverse")
+		sendOnce(&sp.errOnce, sp.Err, errors.New("φ has no inverse"))
 		return
 	}
 	s := new(big.Int).Mul(shat, phiInv)
 	s.Mod(s, q)
 	if s.Sign() == 0 {
-		sp.Err <- errors.New("s = 0; retry signing")
+		sendOnce(&sp.errOnce, sp.Err, errors.New("s = 0; retry signing"))
 		return
 	}
 	// Low-S normalization.
@@ -467,7 +487,7 @@ func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
 	for _, pid := range sp.otherSubset {
 		Rp, err := R.Add(sp.peerK[peerKeyStr(pid)])
 		if err != nil {
-			sp.Err <- fmt.Errorf("R reconstruct: %w", err)
+			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("R reconstruct: %w", err))
 			return
 		}
 		R = Rp
@@ -477,7 +497,7 @@ func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
 		s.Sub(q, s)
 		v ^= 1
 	}
-	sp.Done <- &Signature{R: new(big.Int).Set(sp.r), S: s, V: v}
+	sendOnce(&sp.doneOnce, sp.Done, &Signature{R: new(big.Int).Set(sp.r), S: s, V: v})
 }
 
 // --- helpers --------------------------------------------------------

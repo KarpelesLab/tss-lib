@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
@@ -100,6 +101,12 @@ type ResharingParty struct {
 
 	Done chan *Key
 	Err  chan error
+
+	// Once-guards on Done/Err — see once_send.go. Resharing has the
+	// extra complication of an OLD-only branch that delivers a nil
+	// sentinel on Done; sendOnce handles that path the same way.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewResharing constructs a per-party reshare state machine. The
@@ -308,7 +315,7 @@ func (rp *ResharingParty) oldRound1() error {
 	}
 	// Old-only parties also signal completion now.
 	if !rp.isNew {
-		rp.Done <- nil
+		sendOnce(&rp.doneOnce, rp.Done, nil)
 	}
 	return nil
 }
@@ -341,7 +348,7 @@ func (rp *ResharingParty) onR1Unicast(oldIds []*tss.PartyID, msgs []*reshareR1Un
 // oldRound1.
 func (rp *ResharingParty) startEchoPhase(oldIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -368,7 +375,7 @@ func (rp *ResharingParty) startEchoPhase(oldIds []*tss.PartyID) {
 	out := &echoMsg{Digests: digests}
 	m := tss.JsonWrap(reshareTypeEcho, out, Pi, nil)
 	if err := rp.params.Broker().Receive(m); err != nil {
-		rp.Err <- fmt.Errorf("broker echo broadcast: %w", err)
+		sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("broker echo broadcast: %w", err))
 		return
 	}
 	rcv := tss.NewJsonExpect[echoMsg](reshareTypeEcho, newOthers, func(eids []*tss.PartyID, msgs []*echoMsg) {
@@ -381,7 +388,7 @@ func (rp *ResharingParty) startEchoPhase(oldIds []*tss.PartyID) {
 // OLD dealer's commitments. On consistency, fires afterRound1.
 func (rp *ResharingParty) onEcho(oldIds []*tss.PartyID, echoers []*tss.PartyID, msgs []*echoMsg) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -403,7 +410,7 @@ func (rp *ResharingParty) onEcho(oldIds []*tss.PartyID, echoers []*tss.PartyID, 
 	}
 
 	if err := verifyEchoes(myDigests, selfKey, echoers, msgs, oldIds, echoSourceReshare); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	rp.r1Echoes = msgs
@@ -414,7 +421,7 @@ func (rp *ResharingParty) onEcho(oldIds []*tss.PartyID, echoers []*tss.PartyID, 
 // member have arrived. Verify, aggregate Xi, kick off pairwise OT.
 func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -428,25 +435,25 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 		bc := bcasts[n]
 		uc := ucs[n]
 		if len(bc.VSSCommitments) != 2*(rp.newThreshold+1) {
-			rp.Err <- fmt.Errorf("party %s sent %d Vs coords, expected %d",
-				pid, len(bc.VSSCommitments), 2*(rp.newThreshold+1))
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s sent %d Vs coords, expected %d",
+				pid, len(bc.VSSCommitments), 2*(rp.newThreshold+1)))
 			return
 		}
 		vsj, err := unflattenPointXY(ec, bc.VSSCommitments)
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s Vs decode: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s Vs decode: %w", pid, err))
 			return
 		}
 		shareInt := new(big.Int).SetBytes(uc.Share)
 		// Reject non-canonical (>= q) shares — see keygen_party round2
 		// for the rationale (echo-bypass via non-canonical bytes).
 		if shareInt.Sign() < 0 || shareInt.Cmp(q) >= 0 {
-			rp.Err <- fmt.Errorf("party %s sent non-canonical reshare-share (>= q)", pid)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s sent non-canonical reshare-share (>= q)", pid))
 			return
 		}
 		sh := &vss.Share{Threshold: rp.newThreshold, ID: Pi.KeyInt(), Share: shareInt}
 		if !sh.Verify(ec, rp.newThreshold, vsj) {
-			rp.Err <- fmt.Errorf("party %s reshare-share verification failed", pid)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s reshare-share verification failed", pid))
 			return
 		}
 		rp.receivedShares[peerKeyStr(pid)] = shareInt
@@ -473,7 +480,7 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 		sid := pairBaseSid(rp.ssid, Pi.KeyInt(), Pj.KeyInt(), Pj.KeyInt())
 		snd, sndMsg, err := baseot.NewSender(sid, otext.Kappa, rp.params.Rand())
 		if err != nil {
-			rp.Err <- fmt.Errorf("baseot.NewSender for %s: %w", Pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("baseot.NewSender for %s: %w", Pj, err))
 			return
 		}
 		rp.newOTSnd[peerKeyStr(Pj)] = snd
@@ -487,7 +494,7 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 		}
 		m := tss.JsonWrap(reshareTypeR2, r2, Pi, Pj)
 		if err := rp.params.Broker().Receive(m); err != nil {
-			rp.Err <- fmt.Errorf("broker r2→%s: %w", Pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("broker r2→%s: %w", Pj, err))
 			return
 		}
 	}
@@ -501,7 +508,7 @@ func (rp *ResharingParty) afterRound1(oldIds []*tss.PartyID) {
 
 func (rp *ResharingParty) afterRound2(newOthersFromCB []*tss.PartyID, msgs []*reshareR2, newXi *big.Int, newOthers []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -515,14 +522,14 @@ func (rp *ResharingParty) afterRound2(newOthersFromCB []*tss.PartyID, msgs []*re
 			new(big.Int).SetBytes(r2.OTSenderSX),
 			new(big.Int).SetBytes(r2.OTSenderSY))
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s OT-S invalid: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s OT-S invalid: %w", pid, err))
 			return
 		}
 		alpha, err := crypto.NewECPoint(ec,
 			new(big.Int).SetBytes(r2.OTSenderPokAX),
 			new(big.Int).SetBytes(r2.OTSenderPokAY))
 		if err != nil {
-			rp.Err <- fmt.Errorf("party %s PoK-alpha invalid: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("party %s PoK-alpha invalid: %w", pid, err))
 			return
 		}
 		pok := &schnorr.ZKProof{Alpha: alpha, T: new(big.Int).SetBytes(r2.OTSenderPokT)}
@@ -531,12 +538,12 @@ func (rp *ResharingParty) afterRound2(newOthersFromCB []*tss.PartyID, msgs []*re
 
 		delta := make([]byte, otext.DeltaBytes)
 		if _, err := rp.params.Rand().Read(delta); err != nil {
-			rp.Err <- fmt.Errorf("rand: %w", err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("rand: %w", err))
 			return
 		}
 		rcvr, rcvMsg, err := baseot.NewReceiver(sid, otext.Kappa, delta, sndMsg, rp.params.Rand())
 		if err != nil {
-			rp.Err <- fmt.Errorf("base-OT receiver for %s: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("base-OT receiver for %s: %w", pid, err))
 			return
 		}
 		rp.newOTRcv[peerKeyStr(pid)] = rcvr
@@ -545,7 +552,7 @@ func (rp *ResharingParty) afterRound2(newOthersFromCB []*tss.PartyID, msgs []*re
 		r3 := &keygenR2{OTReceiverR: flattenPointXY(rcvMsg.R)}
 		m := tss.JsonWrap(reshareTypeR3, r3, Pi, pid)
 		if err := rp.params.Broker().Receive(m); err != nil {
-			rp.Err <- fmt.Errorf("broker r3→%s: %w", pid, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("broker r3→%s: %w", pid, err))
 			return
 		}
 	}
@@ -558,7 +565,7 @@ func (rp *ResharingParty) afterRound2(newOthersFromCB []*tss.PartyID, msgs []*re
 
 func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *big.Int, newOthers []*tss.PartyID) {
 	if err := rp.ctx.Err(); err != nil {
-		rp.Err <- err
+		sendOnce(&rp.errOnce, rp.Err, err)
 		return
 	}
 	Pi := rp.params.PartyID()
@@ -579,14 +586,14 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 		} else {
 			next, err := pub.Add(Vs[0])
 			if err != nil {
-				rp.Err <- fmt.Errorf("aggregate pub: %w", err)
+				sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("aggregate pub: %w", err))
 				return
 			}
 			pub = next
 		}
 	}
 	if pub == nil || !pub.Equals(rp.oldECDSAPub) {
-		rp.Err <- errors.New("dklstss: reshare reconstructed public key does not match the advertised oldECDSAPub — at least one OLD participant shipped a malformed VSS commitment")
+		sendOnce(&rp.errOnce, rp.Err, errors.New("dklstss: reshare reconstructed public key does not match the advertised oldECDSAPub — at least one OLD participant shipped a malformed VSS commitment"))
 		return
 	}
 	// From here on, downstream code uses oldECDSAPub for the new Key's
@@ -603,7 +610,7 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 	for _, pj := range rp.newSubset {
 		Xj, err := evaluateCommitmentSum(ec, allCommits, pj.KeyInt())
 		if err != nil {
-			rp.Err <- fmt.Errorf("BigXj[%d]: %w", pj.Index, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("BigXj[%d]: %w", pj.Index, err))
 			return
 		}
 		newBigXj[pj.Index] = Xj
@@ -615,12 +622,12 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 		peerk := peerKeyStr(pj)
 		chosen, err := rp.newOTRcv[peerk].Finalize()
 		if err != nil {
-			rp.Err <- fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("base-OT receiver finalize for %s: %w", pj, err))
 			return
 		}
 		extSender, err := otext.NewExtSenderFromBase(rp.myDelta[peerk], chosen)
 		if err != nil {
-			rp.Err <- fmt.Errorf("ExtSender for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("ExtSender for %s: %w", pj, err))
 			return
 		}
 		var r3 *keygenR2
@@ -631,22 +638,22 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 			}
 		}
 		if r3 == nil {
-			rp.Err <- fmt.Errorf("missing r3 from %s", pj)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("missing r3 from %s", pj))
 			return
 		}
 		rPoints, err := unflattenPointXY(ec, r3.OTReceiverR)
 		if err != nil {
-			rp.Err <- fmt.Errorf("decode R from %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("decode R from %s: %w", pj, err))
 			return
 		}
 		k0, k1, err := rp.newOTSnd[peerk].Finalize(&baseot.ReceiverMsg1{R: rPoints})
 		if err != nil {
-			rp.Err <- fmt.Errorf("base-OT sender finalize for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("base-OT sender finalize for %s: %w", pj, err))
 			return
 		}
 		extReceiver, err := otext.NewExtReceiverFromBase(k0, k1)
 		if err != nil {
-			rp.Err <- fmt.Errorf("ExtReceiver for %s: %w", pj, err)
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("ExtReceiver for %s: %w", pj, err))
 			return
 		}
 		ot[pj.Index] = &PairOTState{AsAlice: extReceiver, AsBob: extSender}
@@ -666,12 +673,12 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 		ChainCode: chainCode,
 	}
 	if err := key.ValidateBasic(); err != nil {
-		rp.Err <- fmt.Errorf("finalize ValidateBasic: %w", err)
+		sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("finalize ValidateBasic: %w", err))
 		return
 	}
 	_ = Pi
 	_ = common.RejectionSample // keep import live across edits
-	rp.Done <- key
+	sendOnce(&rp.doneOnce, rp.Done, key)
 }
 
 // reshareR1Bcast is the OLD→NEW round-1 BROADCAST: Vs commitments

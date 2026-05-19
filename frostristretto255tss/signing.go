@@ -2,6 +2,7 @@ package frostristretto255tss
 
 import (
 	"context"
+	"sync"
 	"fmt"
 	"math/big"
 
@@ -24,6 +25,11 @@ type Signing struct {
 
 	Done chan *SignatureData
 	Err  chan error
+
+	// Once-guards on Done/Err so multi-writer error paths cannot block on
+	// the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewSigning starts a FROST(ristretto255) signing session.
@@ -72,14 +78,15 @@ func (s *Signing) round1() error {
 		otherIds = append(otherIds, p)
 	}
 
+	// Broadcast (D_i, E_i) via a single To==nil message — see the
+	// matching comment in frosttss/signing.go round1 for the
+	// equivocation-defense rationale.
 	r1 := &signRound1msg{
 		Hiding:  s.Di.Bytes(),
 		Binding: s.Ei.Bytes(),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("frost:ristretto255:sign:round1", r1, Pi, p)
-		s.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("frost:ristretto255:sign:round1", r1, Pi, nil)
+	s.params.Broker().Receive(m)
 
 	rcv := tss.NewJsonExpect[signRound1msg]("frost:ristretto255:sign:round1", otherIds, s.round2)
 	s.params.Broker().Connect("frost:ristretto255:sign:round1", rcv)
@@ -88,7 +95,7 @@ func (s *Signing) round1() error {
 
 func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	if s.ctx.Err() != nil {
-		s.Err <- s.ctx.Err()
+		sendOnce(&s.errOnce, s.Err, s.ctx.Err())
 		return
 	}
 	Pi := s.params.PartyID()
@@ -104,12 +111,12 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	for n, pid := range otherIds {
 		Dj, err := g.DecodeElement(r1msgs[n].Hiding)
 		if err != nil {
-			s.Err <- fmt.Errorf("party %s sent invalid hiding commitment: %w", pid, err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("party %s sent invalid hiding commitment: %w", pid, err))
 			return
 		}
 		Ej, err := g.DecodeElement(r1msgs[n].Binding)
 		if err != nil {
-			s.Err <- fmt.Errorf("party %s sent invalid binding commitment: %w", pid, err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("party %s sent invalid binding commitment: %w", pid, err))
 			return
 		}
 		commitments = append(commitments, frost.NonceCommitment{
@@ -122,7 +129,7 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	bindingFactors := frost.ComputeBindingFactors(cs, s.msg, commitments)
 	R, err := frost.ComputeGroupCommitment(commitments, bindingFactors)
 	if err != nil {
-		s.Err <- fmt.Errorf("ComputeGroupCommitment: %w", err)
+		sendOnce(&s.errOnce, s.Err, fmt.Errorf("ComputeGroupCommitment: %w", err))
 		return
 	}
 	c := frost.ComputeGroupChallenge(cs, R, s.key.GroupPublicKey, s.msg)
@@ -139,11 +146,10 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	term3 := modQ.Mul(modQ.Mul(lambda_i, s.key.Xi), c)
 	zi := modQ.Add(modQ.Add(s.di, term2), term3)
 
+	// Broadcast z_i via a single To==nil message (identical per recipient).
 	r2 := &signRound2msg{Z: g.EncodeScalar(zi)}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("frost:ristretto255:sign:round2", r2, Pi, p)
-		s.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("frost:ristretto255:sign:round2", r2, Pi, nil)
+	s.params.Broker().Receive(m)
 
 	rcv := tss.NewJsonExpect[signRound2msg]("frost:ristretto255:sign:round2", otherIds, func(ids []*tss.PartyID, msgs []*signRound2msg) {
 		s.finalize(commitments, bindingFactors, R, c, zi, ids, msgs)
@@ -161,7 +167,7 @@ func (s *Signing) finalize(
 	r2msgs []*signRound2msg,
 ) {
 	if s.ctx.Err() != nil {
-		s.Err <- s.ctx.Err()
+		sendOnce(&s.errOnce, s.Err, s.ctx.Err())
 		return
 	}
 	g := group.Ristretto255()
@@ -185,23 +191,23 @@ func (s *Signing) finalize(
 	for n, pid := range r2Ids {
 		zj, err := g.DecodeScalar(r2msgs[n].Z)
 		if err != nil {
-			s.Err <- fmt.Errorf("party %s sent invalid z: %w", pid, err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("party %s sent invalid z: %w", pid, err))
 			return
 		}
 		cm, ok := commitByID[pid.KeyInt().String()]
 		if !ok {
-			s.Err <- fmt.Errorf("missing nonce commitment for signer %s", pid)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("missing nonce commitment for signer %s", pid))
 			return
 		}
 		Yj, ok := bigXByID[pid.KeyInt().String()]
 		if !ok {
-			s.Err <- fmt.Errorf("missing verification share for signer %s", pid)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("missing verification share for signer %s", pid))
 			return
 		}
 		rho_j := bindingFactors[cm.Identifier.String()]
 		commitShare, err := cm.Hiding.Add(cm.Binding.ScalarMult(rho_j))
 		if err != nil {
-			s.Err <- fmt.Errorf("computing commitment_share for %s: %w", pid, err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("computing commitment_share for %s: %w", pid, err))
 			return
 		}
 		lambda_j := frost.LagrangeCoefficient(cs, cm.Identifier, signerIDs)
@@ -209,11 +215,11 @@ func (s *Signing) finalize(
 		lhs := g.ScalarBaseMult(zj)
 		rhs, err := commitShare.Add(Yj.ScalarMult(clambda))
 		if err != nil {
-			s.Err <- fmt.Errorf("computing verifier rhs for %s: %w", pid, err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("computing verifier rhs for %s: %w", pid, err))
 			return
 		}
 		if !lhs.Equal(rhs) {
-			s.Err <- fmt.Errorf("partial signature from %s failed verification", pid)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("partial signature from %s failed verification", pid))
 			return
 		}
 		z = modQ.Add(z, zj)
@@ -229,20 +235,20 @@ func (s *Signing) finalize(
 	lhs := g.ScalarBaseMult(z)
 	rhs, err := R.Add(s.key.GroupPublicKey.ScalarMult(c))
 	if err != nil {
-		s.Err <- fmt.Errorf("self-verify: %w", err)
+		sendOnce(&s.errOnce, s.Err, fmt.Errorf("self-verify: %w", err))
 		return
 	}
 	if !lhs.Equal(rhs) {
-		s.Err <- fmt.Errorf("frostristretto255tss: aggregated signature failed local Schnorr check")
+		sendOnce(&s.errOnce, s.Err, fmt.Errorf("frostristretto255tss: aggregated signature failed local Schnorr check"))
 		return
 	}
 
-	s.Done <- &SignatureData{
+	sendOnce(&s.doneOnce, s.Done, &SignatureData{
 		R:         rEnc,
 		S:         sEnc,
 		Signature: sig,
 		M:         s.msg,
-	}
+	})
 }
 
 // VerifySignature reproduces the FROST(ristretto255) verification equation:

@@ -188,8 +188,20 @@ func verifyZeroConstShare(Vs []*crypto.ECPoint, id, share *big.Int) bool {
 	q := curve.Params().N
 
 	idPow := new(big.Int).Mod(id, q)
+	if idPow.Sign() == 0 {
+		// id ≡ 0 mod q would make every term · G the identity, and
+		// downstream ECPoint.ScalarMult/NewECPoint would panic on (0,0).
+		// CheckIndexes prevents this at protocol level; the explicit
+		// reject here is defense-in-depth.
+		return false
+	}
 	var rhs *crypto.ECPoint
 	for _, V := range Vs {
+		if !V.ValidateBasic() {
+			// A peer that ships a V[k] which is nil-coord or off-curve
+			// would otherwise panic inside ScalarMult. Reject cleanly.
+			return false
+		}
 		term := V.ScalarMult(idPow)
 		if rhs == nil {
 			rhs = term

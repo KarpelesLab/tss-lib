@@ -2,6 +2,7 @@ package eddsatss
 
 import (
 	"context"
+	"sync"
 	"crypto/sha512"
 	"errors"
 	"fmt"
@@ -31,6 +32,11 @@ type Signing struct {
 
 	Done chan *SignatureData
 	Err  chan error
+
+	// Once-guards on Done/Err so multi-writer error paths cannot block on
+	// the size-1 buffer. See once_send.go for the rationale.
+	doneOnce sync.Once
+	errOnce  sync.Once
 }
 
 // NewSigning creates a new Signing instance and kicks off round 1 of the EdDSA signing protocol.
@@ -131,14 +137,18 @@ func (s *Signing) round1() error {
 		otherIds = append(otherIds, p)
 	}
 
-	// broadcast round 1 message: commitment
+	// Broadcast round 1 commitment via a single To==nil message. The
+	// hash commitment to point R_i has identical bytes for every
+	// recipient; sending it as a true broadcast lets a well-behaved
+	// broker enforce "same bytes to every recipient" rather than
+	// allowing a malicious sender to equivocate by shipping different
+	// commitments under N-1 unicasts. Round-2 decommit + Schnorr PoK
+	// then enforces correctness regardless.
 	msg := &signRound1msg{
 		Commitment: cmt.C.Bytes(),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("eddsa:sign:round1", msg, Pi, p)
-		s.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("eddsa:sign:round1", msg, Pi, nil)
+	s.params.Broker().Receive(m)
 
 	// register receiver for round 1 messages from others -> triggers round 2
 	rcv := tss.NewJsonExpect[signRound1msg]("eddsa:sign:round1", otherIds, s.round2)
@@ -149,7 +159,7 @@ func (s *Signing) round1() error {
 
 func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	if s.ctx.Err() != nil {
-		s.Err <- s.ctx.Err()
+		sendOnce(&s.errOnce, s.Err, s.ctx.Err())
 		return
 	}
 	Pi := s.params.PartyID()
@@ -169,21 +179,20 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	ContextI := append(s.ssid, new(big.Int).SetUint64(uint64(i)).Bytes()...)
 	pir, err := schnorr.NewZKProof(ContextI, s.ri, s.pointRi, s.params.Rand())
 	if err != nil {
-		s.Err <- fmt.Errorf("NewZKProof(ri, pointRi): %w", err)
+		sendOnce(&s.errOnce, s.Err, fmt.Errorf("NewZKProof(ri, pointRi): %w", err))
 		return
 	}
 
-	// broadcast decommitment + Schnorr proof
+	// Broadcast decommitment + Schnorr proof via a single To==nil message
+	// (identical bytes per recipient — see round1 for the rationale).
 	r2msg := &signRound2msg{
 		DeCommitment:       common.BigIntsToBytes(s.deCommit),
 		SchnorrProofAlphaX: pir.Alpha.X().Bytes(),
 		SchnorrProofAlphaY: pir.Alpha.Y().Bytes(),
 		SchnorrProofT:      pir.T.Bytes(),
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("eddsa:sign:round2", r2msg, Pi, p)
-		s.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("eddsa:sign:round2", r2msg, Pi, nil)
+	s.params.Broker().Receive(m)
 
 	// register receiver for round 2 messages from others -> triggers round 3
 	rcv := tss.NewJsonExpect[signRound2msg]("eddsa:sign:round2", otherIds, s.round3)
@@ -192,7 +201,7 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 
 func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 	if s.ctx.Err() != nil {
-		s.Err <- s.ctx.Err()
+		sendOnce(&s.errOnce, s.Err, s.ctx.Err())
 		return
 	}
 	Pi := s.params.PartyID()
@@ -215,7 +224,7 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 			}
 		}
 		if j == -1 {
-			s.Err <- errors.New("party not found")
+			sendOnce(&s.errOnce, s.Err, errors.New("party not found"))
 			return
 		}
 
@@ -226,17 +235,17 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 		cmtDeCmt := cmts.HashCommitDecommit{C: s.cjs[j], D: KGDj}
 		ok, coordinates := cmtDeCmt.DeCommit()
 		if !ok {
-			s.Err <- errors.New("de-commitment verify failed")
+			sendOnce(&s.errOnce, s.Err, errors.New("de-commitment verify failed"))
 			return
 		}
 		if len(coordinates) != 2 {
-			s.Err <- errors.New("length of de-commitment should be 2")
+			sendOnce(&s.errOnce, s.Err, errors.New("length of de-commitment should be 2"))
 			return
 		}
 
 		Rj, err := crypto.NewECPoint(ec, coordinates[0], coordinates[1])
 		if err != nil {
-			s.Err <- fmt.Errorf("NewECPoint(Rj): %w", err)
+			sendOnce(&s.errOnce, s.Err, fmt.Errorf("NewECPoint(Rj): %w", err))
 			return
 		}
 		Rj = Rj.EightInvEight()
@@ -246,7 +255,7 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 		alphaY := new(big.Int).SetBytes(r2msgs[n].SchnorrProofAlphaY)
 		alpha, err := crypto.NewECPoint(ec, alphaX, alphaY)
 		if err != nil {
-			s.Err <- errors.New("failed to reconstruct Schnorr proof alpha point")
+			sendOnce(&s.errOnce, s.Err, errors.New("failed to reconstruct Schnorr proof alpha point"))
 			return
 		}
 		proof := &schnorr.ZKProof{
@@ -254,7 +263,7 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 			T:     new(big.Int).SetBytes(r2msgs[n].SchnorrProofT),
 		}
 		if !proof.Verify(ContextJ, Rj) {
-			s.Err <- errors.New("Schnorr proof verification failed for Rj")
+			sendOnce(&s.errOnce, s.Err, errors.New("Schnorr proof verification failed for Rj"))
 			return
 		}
 
@@ -288,14 +297,12 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 	// store R for finalization
 	r := encodedBytesToBigInt(&encodedR)
 
-	// broadcast si
+	// Broadcast si via a single To==nil message (identical per recipient).
 	r3msg := &signRound3msg{
 		Si: localS[:],
 	}
-	for _, p := range otherIds {
-		m := tss.JsonWrap("eddsa:sign:round3", r3msg, Pi, p)
-		s.params.Broker().Receive(m)
-	}
+	m := tss.JsonWrap("eddsa:sign:round3", r3msg, Pi, nil)
+	s.params.Broker().Receive(m)
 
 	// register receiver for round 3 messages from others -> triggers finalize
 	rcv := tss.NewJsonExpect[signRound3msg]("eddsa:sign:round3", otherIds, func(ids []*tss.PartyID, msgs []*signRound3msg) {
@@ -309,7 +316,7 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 
 func (s *Signing) finalize(r *big.Int, localS *[32]byte, encodedR *[32]byte, r3msgs []*signRound3msg) {
 	if s.ctx.Err() != nil {
-		s.Err <- s.ctx.Err()
+		sendOnce(&s.errOnce, s.Err, s.ctx.Err())
 		return
 	}
 	// sum all sj: start with our own si
@@ -343,9 +350,9 @@ func (s *Signing) finalize(r *big.Int, localS *[32]byte, encodedR *[32]byte, r3m
 
 	ok := edwards25519.VerifyRS(&pk, sigData.M, r, sInt)
 	if !ok {
-		s.Err <- fmt.Errorf("signature verification failed")
+		sendOnce(&s.errOnce, s.Err, fmt.Errorf("signature verification failed"))
 		return
 	}
 
-	s.Done <- sigData
+	sendOnce(&s.doneOnce, s.Done, sigData)
 }

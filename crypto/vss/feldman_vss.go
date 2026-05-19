@@ -17,8 +17,12 @@ import (
 	"io"
 	"math/big"
 
+	"github.com/KarpelesLab/edwards25519"
+	"github.com/KarpelesLab/secp256k1"
+
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/ctmul"
 )
 
 type (
@@ -85,7 +89,13 @@ func Create(ec elliptic.Curve, threshold int, secret *big.Int, indexes []*big.In
 
 	v := make(Vs, len(poly))
 	for i, ai := range poly {
-		v[i] = crypto.ScalarBaseMult(ec, ai)
+		// v[0] = secret · G is the dealer's contribution to the joint
+		// public key — leaking bits of `secret` via timing recovers a
+		// share of the joint secret. The other v[i] are commitments
+		// to random masking coefficients but go through the same CT
+		// path for code uniformity (the perf delta is sub-millisecond
+		// over a typical t+1 ≤ 7 invocations).
+		v[i] = ctScalarBaseMult(ec, ai)
 	}
 
 	shares := make(Shares, num)
@@ -166,6 +176,31 @@ func samplePolynomial(ec elliptic.Curve, threshold int, secret *big.Int, rand io
 		v[i] = ai
 	}
 	return v
+}
+
+// ctScalarBaseMult is the curve-aware constant-time-or-best-effort
+// scalar-base multiplication used by VSS commitment construction. The
+// dealer's secret polynomial coefficients pass through here; routing
+// them through Go's standard `crypto.ScalarBaseMult` (which is not
+// documented as constant-time on either secp256k1 or Ed25519) was the
+// audit finding addressed by this dispatcher.
+//
+// Routing:
+//   - secp256k1: ctmul.ScalarBaseMult (Montgomery ladder with Z-
+//     randomization and 64-bit scalar blinding).
+//   - Ed25519:   crypto.CTScalarBaseMultEd25519 (edwards25519 fixed-
+//     base table).
+//   - any other curve: falls back to crypto.ScalarBaseMult. VSS is used
+//     today only with these two curves, so the fallback is dead in the
+//     current codebase but keeps the function total.
+func ctScalarBaseMult(ec elliptic.Curve, k *big.Int) *crypto.ECPoint {
+	if ec == secp256k1.S256() {
+		return ctmul.ScalarBaseMult(ec, k)
+	}
+	if ec == edwards25519.Edwards() {
+		return crypto.CTScalarBaseMultEd25519(ec, k)
+	}
+	return crypto.ScalarBaseMult(ec, k)
 }
 
 // Evauluates a polynomial with coefficients such that:
