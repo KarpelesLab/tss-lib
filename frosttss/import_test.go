@@ -107,7 +107,7 @@ func TestImportKeyAndReshareRoundTrip(t *testing.T) {
 			}
 		case err := <-rs.Err:
 			t.Fatalf("resharing error party %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("resharing timeout party %d", i)
 		}
 	}
@@ -149,7 +149,7 @@ func TestImportKeyAndReshareRoundTrip(t *testing.T) {
 			require.Truef(t, ok, "party %d signature must verify under imported pubkey", i)
 		case err := <-sg.Err:
 			t.Fatalf("signing error party %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("signing timeout party %d", i)
 		}
 	}

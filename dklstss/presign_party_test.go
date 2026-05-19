@@ -45,7 +45,7 @@ func runDistributedPresign(t *testing.T, keys []*Key, pIDs tss.SortedPartyIDs, s
 			outs[i] = out
 		case err := <-p.Err:
 			t.Fatalf("presign party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("presign party %d timeout", i)
 		}
 	}

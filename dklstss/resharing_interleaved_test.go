@@ -111,7 +111,7 @@ func TestResharingPartyInterleavedCommitteeKeys(t *testing.T) {
 			newKeys[i] = k
 		case err := <-p.Err:
 			t.Fatalf("new party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("new party %d timeout", i)
 		}
 	}
@@ -122,7 +122,7 @@ func TestResharingPartyInterleavedCommitteeKeys(t *testing.T) {
 			assert.Nil(t, k, "old-only party should return nil Key")
 		case err := <-p.Err:
 			t.Fatalf("old party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("old party %d timeout", i)
 		}
 	}

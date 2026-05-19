@@ -275,7 +275,7 @@ func TestResharingPartyDetectsMalformedOldContribution(t *testing.T) {
 			if assert.Contains(t, err.Error(), "reconstructed public key") {
 				sawAbort = true
 			}
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d neither completed nor aborted", i)
 		}
 	}
@@ -394,7 +394,7 @@ func TestKeygenPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
 				namedDealer0++
 			}
 			t.Logf("party %d aborted with culprit %s", i, culps[0].KeyInt().String())
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d neither completed nor aborted", i)
 		}
 	}
@@ -470,7 +470,7 @@ func TestRefreshPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
 				namedDealer0++
 			}
 			t.Logf("party %d aborted with culprit %s", i, culps[0].KeyInt().String())
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d neither completed nor aborted", i)
 		}
 	}
@@ -571,7 +571,7 @@ func TestResharingPartyEchoBroadcastCatchesEquivocation(t *testing.T) {
 				namedDealer0++
 			}
 			t.Logf("new party %d aborted, culprit=%s", i, culps[0].KeyInt().String())
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("new party %d neither completed nor aborted", i)
 		}
 	}

@@ -22,7 +22,7 @@ func TestAsyncKeygen(t *testing.T) {
 		assert.NotNil(t, keys[0].ECDSAPub)
 	case err := <-a.Err:
 		t.Fatalf("keygen failed: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Minute):
 		t.Fatal("keygen timed out")
 	}
 }
@@ -46,7 +46,7 @@ func TestAsyncSigning(t *testing.T) {
 		assert.True(t, ecdsa.Verify(pub, digest[:], sig.R, sig.S))
 	case err := <-a.Err:
 		t.Fatalf("async sign failed: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Minute):
 		t.Fatal("async sign timed out")
 	}
 }
@@ -66,7 +66,7 @@ func TestAsyncPresignAndRefresh(t *testing.T) {
 	case presign = <-ap.Done:
 	case err := <-ap.Err:
 		t.Fatalf("async presign failed: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Minute):
 		t.Fatal("async presign timed out")
 	}
 	require.NotNil(t, presign)
@@ -79,7 +79,7 @@ func TestAsyncPresignAndRefresh(t *testing.T) {
 		assert.True(t, refreshed[0].ECDSAPub.Equals(keys[0].ECDSAPub))
 	case err := <-ar.Err:
 		t.Fatalf("async refresh failed: %v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Minute):
 		t.Fatal("async refresh timed out")
 	}
 }

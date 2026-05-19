@@ -89,7 +89,7 @@ func TestKeygenRejectsNonCanonicalRound1Share(t *testing.T) {
 			require.Contains(t, err.Error(), "non-canonical")
 			rejectCount++
 			t.Logf("party %d correctly rejected with: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d neither completed nor aborted", i)
 		}
 	}

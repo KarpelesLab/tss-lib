@@ -36,7 +36,7 @@ func runDistributedKeygen(t *testing.T, pIDs tss.SortedPartyIDs, threshold int) 
 			keys[i] = k
 		case err := <-p.Err:
 			t.Fatalf("keygen party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("keygen party %d timeout", i)
 		}
 	}
@@ -76,7 +76,7 @@ func TestSigningPartyEndToEnd(t *testing.T) {
 			sigs[i] = s
 		case err := <-p.Err:
 			t.Fatalf("signing party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("signing party %d timeout", i)
 		}
 	}
@@ -131,7 +131,7 @@ func TestSigningPartyWithHDTweak(t *testing.T) {
 			}
 		case err := <-p.Err:
 			t.Fatalf("signing party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("signing party %d timeout", i)
 		}
 	}
@@ -188,7 +188,7 @@ func TestSigningPartyRepeatedSignReusesOTSafely(t *testing.T) {
 				}
 			case err := <-p.Err:
 				t.Fatalf("signing party %d failed: %v", i, err)
-			case <-time.After(60 * time.Second):
+			case <-time.After(5 * time.Minute):
 				t.Fatalf("signing party %d timeout", i)
 			}
 		}

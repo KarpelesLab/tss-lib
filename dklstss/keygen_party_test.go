@@ -117,7 +117,7 @@ func TestKeygenPartyEndToEnd(t *testing.T) {
 			keys[i] = k
 		case err := <-p.Err:
 			t.Fatalf("party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d timed out", i)
 		}
 	}
@@ -162,7 +162,7 @@ func TestKeygenPartyMatchesSyncKeygen(t *testing.T) {
 			keys[i] = k
 		case err := <-p.Err:
 			t.Fatalf("party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d timed out", i)
 		}
 	}

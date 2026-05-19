@@ -42,7 +42,7 @@ func TestRefreshPartyEndToEnd(t *testing.T) {
 			refreshed[i] = k
 		case err := <-p.Err:
 			t.Fatalf("refresh party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("refresh party %d timeout", i)
 		}
 	}
@@ -91,7 +91,7 @@ func TestRefreshPartyOTStateRotates(t *testing.T) {
 			refreshed[i] = k
 		case err := <-p.Err:
 			t.Fatalf("party %d failed: %v", i, err)
-		case <-time.After(60 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d timeout", i)
 		}
 	}

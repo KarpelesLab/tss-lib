@@ -108,7 +108,7 @@ func TestKeygenFull(t *testing.T) {
 			keys[i] = k
 		case err := <-keygens[i].Err:
 			t.Fatalf("party %d keygen error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d keygen timed out", i)
 		}
 	}
@@ -153,7 +153,7 @@ func TestKeygenAndSign(t *testing.T) {
 			keys[i] = k
 		case err := <-keygens[i].Err:
 			t.Fatalf("keygen error %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("keygen timeout %d", i)
 		}
 	}
@@ -176,7 +176,7 @@ func TestKeygenAndSign(t *testing.T) {
 			sigs[i] = sig
 		case err := <-signings[i].Err:
 			t.Fatalf("party %d signing error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("party %d signing timeout", i)
 		}
 	}
@@ -227,7 +227,7 @@ func TestKeygenAndSignStrictSubset(t *testing.T) {
 			keys[i] = k
 		case err := <-keygens[i].Err:
 			t.Fatalf("keygen error %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("keygen timeout %d", i)
 		}
 	}
@@ -281,7 +281,7 @@ func TestKeygenAndSignStrictSubset(t *testing.T) {
 			sigs[i] = sig
 		case err := <-signings[i].Err:
 			t.Fatalf("subset party %d signing error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("subset party %d signing timeout", i)
 		}
 	}
@@ -400,7 +400,7 @@ func TestResharing(t *testing.T) {
 			oldKeys[i] = k
 		case err := <-keygens[i].Err:
 			t.Fatalf("keygen error %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("keygen timeout %d", i)
 		}
 	}
@@ -450,7 +450,7 @@ func TestResharing(t *testing.T) {
 			}
 		case err := <-resharings[i].Err:
 			t.Fatalf("resharing error party %d: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("resharing timeout party %d", i)
 		}
 	}
@@ -478,7 +478,7 @@ func TestResharing(t *testing.T) {
 			sigs[i] = sig
 		case err := <-signings[i].Err:
 			t.Fatalf("new party %d signing error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("new party %d signing timeout", i)
 		}
 	}

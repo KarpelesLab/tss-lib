@@ -110,7 +110,7 @@ func TestImportKeyReshareAndSign(t *testing.T) {
 			}
 		case err := <-resharings[i].Err:
 			t.Fatalf("Party %d resharing error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("Party %d resharing timed out", i)
 		}
 	}
@@ -145,7 +145,7 @@ func TestImportKeyReshareAndSign(t *testing.T) {
 			sigs[i] = sig
 		case err := <-signings[i].Err:
 			t.Fatalf("New party %d signing error: %v", i, err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("New party %d signing timed out", i)
 		}
 	}

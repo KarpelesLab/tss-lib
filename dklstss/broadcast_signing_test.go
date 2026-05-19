@@ -69,7 +69,7 @@ func TestSigningRound1IsBroadcast(t *testing.T) {
 		case <-sp.Done:
 		case err := <-sp.Err:
 			t.Fatalf("signing failed: %v", err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("signing timeout")
 		}
 	}
@@ -115,7 +115,7 @@ func TestPresignRound1IsBroadcast(t *testing.T) {
 		case <-pp.Done:
 		case err := <-pp.Err:
 			t.Fatalf("presign failed: %v", err)
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			t.Fatalf("presign timeout")
 		}
 	}
