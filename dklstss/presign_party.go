@@ -2,11 +2,11 @@ package dklstss
 
 import (
 	"context"
-	"sync"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"

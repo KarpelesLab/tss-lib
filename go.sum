@@ -8,7 +8,7 @@ github.com/KarpelesLab/blake256 v1.0.1 h1:nX2AhNgz2YRAlTdLlapEnOIyKxT7Le22OntKtD
 github.com/KarpelesLab/blake256 v1.0.1/go.mod h1:DgAiY5aPPMQGqb5zlsM2aLVwAaWoTbkLS6HISDb3gCA=
 github.com/KarpelesLab/edwards25519 v1.1.7 h1:03Yr0HxxIvzuupdqLKRjC9P6Em3rl+CpgDZEA/xqkVs=
 github.com/KarpelesLab/edwards25519 v1.1.7/go.mod h1:NikirayExusFY4vgi5ENCCMxOjkcF8uD6yA/y+a2iJ8=
-github.com/KarpelesLab/mldsa v0.1.3 h1:L+igpqUdFi+vb8dTitq/ybJbkLUpWTWiHlUg0vbxM9I=
+github.com/KarpelesLab/mldsa v0.1.3 h1:EDUUFYCw4ZHl+N/2CzM1K/EN23C1iZnFc/R1N9IrC/Y=
 github.com/KarpelesLab/mldsa v0.1.3/go.mod h1:x1T4Gyd86wpLwnk1LafWJCqD3EwvhZKXK+0QfHgqZBk=
 github.com/KarpelesLab/secp256k1 v0.2.8 h1:VNkim4pC82SliqHgpFESGVB1o27F+HYgbTq6z/7xHew=
 github.com/KarpelesLab/secp256k1 v0.2.8/go.mod h1:M2Gltf+zSqq2h164eczlRLdydwZgPDoM0GkTqi+Ep3s=

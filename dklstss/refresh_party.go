@@ -25,19 +25,19 @@ import (
 //
 // Rounds:
 //
-//   Round 1: unicast per peer of (VSS commitments to zero-constant
-//            polynomial, share evaluated at peer ID, base-OT-Sender msg
-//            for the direction where peer becomes ExtSender).
-//   Round 2: unicast per peer of base-OT-Receiver R-points (for the
-//            direction where self becomes ExtSender).
-//   Finalize: assemble new Key.
+//	Round 1: unicast per peer of (VSS commitments to zero-constant
+//	         polynomial, share evaluated at peer ID, base-OT-Sender msg
+//	         for the direction where peer becomes ExtSender).
+//	Round 2: unicast per peer of base-OT-Receiver R-points (for the
+//	         direction where self becomes ExtSender).
+//	Finalize: assemble new Key.
 type RefreshParty struct {
 	ctx    context.Context
 	params *tss.Parameters
 	old    *Key
 	ssid   []byte
 
-	coeffs []*big.Int       // a_{i,1}..a_{i,T}
+	coeffs []*big.Int        // a_{i,1}..a_{i,T}
 	vsSelf []*crypto.ECPoint // T entries: V_{i,k} = a_{i,k} · G
 
 	// own evaluations of f_i(j) for every peer j (incl. self).

@@ -2,9 +2,9 @@ package frosttss
 
 import (
 	"context"
-	"sync"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/tss-lib/v2/common"

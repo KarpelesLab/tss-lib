@@ -92,8 +92,8 @@ func TestKeygenPanicResistance(t *testing.T) {
 	}{
 		{0, 0},
 		{1, 0},
-		{2, 0},   // threshold = 0 should be rejected (signing needs >= 2 parties for an actual share)
-		{2, 2},   // threshold = N requires N parties, only valid for some interpretations
+		{2, 0}, // threshold = 0 should be rejected (signing needs >= 2 parties for an actual share)
+		{2, 2}, // threshold = N requires N parties, only valid for some interpretations
 		{-1, 1},
 		{3, -1},
 	}

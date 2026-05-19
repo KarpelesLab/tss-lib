@@ -2,9 +2,9 @@ package frosttss
 
 import (
 	"context"
-	"sync"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -17,12 +17,12 @@ import (
 // Keygen tracks a key currently being generated via the FROST Pedersen DKG
 // (RFC 9591 Appendix D).
 type Keygen struct {
-	ctx     context.Context
-	params  *tss.Parameters
-	vs      vss.Vs    // local polynomial commitments (Feldman)
-	shares  vss.Shares // local shares for every party
-	a_i_0   *big.Int  // local secret coefficient — retained for the round-1 Schnorr PoK
-	data    *Key
+	ctx    context.Context
+	params *tss.Parameters
+	vs     vss.Vs     // local polynomial commitments (Feldman)
+	shares vss.Shares // local shares for every party
+	a_i_0  *big.Int   // local secret coefficient — retained for the round-1 Schnorr PoK
+	data   *Key
 
 	Done chan *Key
 	Err  chan error
@@ -303,4 +303,3 @@ func buildKeygenSession(partyKey *big.Int) []byte {
 	s = append(s, partyKey.Bytes()...)
 	return s
 }
-

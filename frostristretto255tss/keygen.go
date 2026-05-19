@@ -2,9 +2,9 @@ package frostristretto255tss
 
 import (
 	"context"
-	"sync"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"

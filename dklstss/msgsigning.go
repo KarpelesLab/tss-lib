@@ -12,10 +12,10 @@ type SignRound1msg struct {
 // SignMulAliceMsg is one direction of a ΠMul invocation: Alice's OT
 // extension envelope. Sent P2P from one signer to one peer.
 type SignMulAliceMsg struct {
-	L uint32   `json:"l"`        // L=256 for secp256k1 ΠMul
-	U [][]byte `json:"u"`        // Kappa rows, each L/8 bytes
-	X []byte   `json:"x_check"`  // SigmaBytes bits packed
-	T []byte   `json:"t_check"`  // Sigma · DeltaBytes flat-packed
+	L uint32   `json:"l"`       // L=256 for secp256k1 ΠMul
+	U [][]byte `json:"u"`       // Kappa rows, each L/8 bytes
+	X []byte   `json:"x_check"` // SigmaBytes bits packed
+	T []byte   `json:"t_check"` // Sigma · DeltaBytes flat-packed
 }
 
 // SignMulBobMsg is Bob's reply to one ΠMul invocation: ScalarBits
@@ -42,9 +42,9 @@ type SignRound3msg struct {
 
 // Message-type strings.
 const (
-	SignMsgTypeRound1         = "dkls:sign:round1"
-	SignMsgTypeMulAlice       = "dkls:sign:mul:alice"
-	SignMsgTypeMulBob         = "dkls:sign:mul:bob"
-	SignMsgTypeCheckedMulBob  = "dkls:sign:checkedmul:bob"
-	SignMsgTypeRound3         = "dkls:sign:round3"
+	SignMsgTypeRound1        = "dkls:sign:round1"
+	SignMsgTypeMulAlice      = "dkls:sign:mul:alice"
+	SignMsgTypeMulBob        = "dkls:sign:mul:bob"
+	SignMsgTypeCheckedMulBob = "dkls:sign:checkedmul:bob"
+	SignMsgTypeRound3        = "dkls:sign:round3"
 )

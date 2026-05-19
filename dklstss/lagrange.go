@@ -83,9 +83,9 @@ func validateSortedSubset(subset tss.SortedPartyIDs) error {
 // does NOT verify under crypto/ecdsa.Verify (which truncates correctly).
 //
 // This implementation:
-//   1. If len(hash)*8 <= q.BitLen(): big-endian SetBytes is canonical.
-//   2. Otherwise: right-shift so only the top q.BitLen() bits remain.
-//   3. Reduce mod q.
+//  1. If len(hash)*8 <= q.BitLen(): big-endian SetBytes is canonical.
+//  2. Otherwise: right-shift so only the top q.BitLen() bits remain.
+//  3. Reduce mod q.
 //
 // The function is constant-time on the value of `hash` (the only branch
 // is on length, which is public protocol metadata).

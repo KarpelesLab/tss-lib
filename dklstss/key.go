@@ -34,10 +34,10 @@ import (
 // identifiable abort — that surface was removed because the parties did
 // not in fact use it.
 type Key struct {
-	Curve    elliptic.Curve   `json:"-"`
-	N        int              // total number of parties
-	T        int              // threshold (signing requires T+1 parties)
-	Idx      int              // 0-based index of this party in PartyIDs
+	Curve    elliptic.Curve `json:"-"`
+	N        int            // total number of parties
+	T        int            // threshold (signing requires T+1 parties)
+	Idx      int            // 0-based index of this party in PartyIDs
 	PartyIDs tss.SortedPartyIDs
 
 	// Xi is this party's Shamir secret share, evaluated at id_Idx.

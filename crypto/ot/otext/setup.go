@@ -21,7 +21,7 @@ import (
 // of an ExtSender explicitly when the OT extension session is no longer
 // needed by overwriting the struct with the zero value.
 type ExtSender struct {
-	delta [DeltaBytes]byte    // κ-bit secret
+	delta [DeltaBytes]byte     // κ-bit secret
 	seeds [Kappa][SeedLen]byte // seeds[j] = base-OT output for Δ_j
 }
 

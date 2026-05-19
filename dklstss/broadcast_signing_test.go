@@ -16,9 +16,9 @@ import (
 // Wraps an underlying hubBroker so the routed behavior is preserved.
 type observingBroker struct {
 	*hubBroker
-	tag             string
-	bcastCount      int
-	unicastCount    int
+	tag          string
+	bcastCount   int
+	unicastCount int
 }
 
 func (b *observingBroker) Receive(msg *tss.JsonMessage) error {

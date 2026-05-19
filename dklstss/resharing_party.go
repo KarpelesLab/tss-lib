@@ -54,10 +54,10 @@ type ResharingParty struct {
 	oldECDSAPub *crypto.ECPoint
 
 	// OLD role.
-	isOld         bool
-	oldKey        *Key
-	oldSubset     tss.SortedPartyIDs // participating old members (incl. self if isOld)
-	oldLambda     *big.Int
+	isOld     bool
+	oldKey    *Key
+	oldSubset tss.SortedPartyIDs // participating old members (incl. self if isOld)
+	oldLambda *big.Int
 
 	// NEW role.
 	isNew        bool
@@ -68,8 +68,8 @@ type ResharingParty struct {
 	ssid []byte
 
 	// NEW-side accumulators.
-	receivedShares  map[string]*big.Int     // by old participant key
-	receivedCommits map[string]vss.Vs       // by old participant key
+	receivedShares  map[string]*big.Int // by old participant key
+	receivedCommits map[string]vss.Vs   // by old participant key
 	newOTSnd        map[string]*baseot.Sender
 	newOTRcv        map[string]*baseot.Receiver
 	myDelta         map[string][]byte
@@ -602,6 +602,19 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 
 	// BigXj[j] = sum of (Vs[k] · id_j^k) over all old participants.
 	// Evaluating the summed polynomial at id_j.
+	// newBigXj and ot are indexed by position within rp.newSubset — i.e.
+	// the same indexing used by rp.myNewIdx and the returned Key.Idx.
+	// PartyID.Index refers to position in params.Parties() (the combined
+	// OLD+NEW peer context), which can be outside [0, n) for any OLD
+	// party that sorts before a NEW party in the combined view.
+	// Concretely: OLD ids {10,20,30} + NEW ids {15,25,35} interleave in
+	// the combined sort, so each NEW party's params-context Index
+	// (1, 3, 5) exceeds n=3 and writing newBigXj[pj.Index] panics with
+	// "index out of range". Use a newSubset-relative position map.
+	newSubsetPos := make(map[string]int, n)
+	for i, p := range rp.newSubset {
+		newSubsetPos[p.KeyInt().String()] = i
+	}
 	newBigXj := make([]*crypto.ECPoint, n)
 	allCommits := make([]vss.Vs, 0, len(rp.receivedCommits))
 	for _, c := range rp.receivedCommits {
@@ -610,10 +623,10 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 	for _, pj := range rp.newSubset {
 		Xj, err := evaluateCommitmentSum(ec, allCommits, pj.KeyInt())
 		if err != nil {
-			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("BigXj[%d]: %w", pj.Index, err))
+			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("BigXj[%s]: %w", pj.KeyInt(), err))
 			return
 		}
-		newBigXj[pj.Index] = Xj
+		newBigXj[newSubsetPos[pj.KeyInt().String()]] = Xj
 	}
 
 	// Pairwise OT setup → fold finalize calls.
@@ -656,7 +669,9 @@ func (rp *ResharingParty) finalize(_ []*tss.PartyID, msgs []*keygenR2, newXi *bi
 			sendOnce(&rp.errOnce, rp.Err, fmt.Errorf("ExtReceiver for %s: %w", pj, err))
 			return
 		}
-		ot[pj.Index] = &PairOTState{AsAlice: extReceiver, AsBob: extSender}
+		// Same newSubset-relative indexing as newBigXj above — see the
+		// comment there for the OLD+NEW interleave bug this avoids.
+		ot[newSubsetPos[pj.KeyInt().String()]] = &PairOTState{AsAlice: extReceiver, AsBob: extSender}
 	}
 
 	chainCode := deriveChainCode(pub)

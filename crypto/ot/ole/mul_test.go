@@ -2,8 +2,8 @@ package ole
 
 import (
 	"crypto/rand"
-	mathrand "math/rand"
 	"math/big"
+	mathrand "math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/assert"

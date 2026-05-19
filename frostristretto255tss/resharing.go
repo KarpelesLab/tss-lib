@@ -23,9 +23,9 @@ type Resharing struct {
 	input  *Key
 
 	// Old committee round-1 state.
-	newVs        []group.Element
-	newShares    []*vssShare
-	vDecommit    []byte // commitElements decommit bytes (kept for round 3 broadcast)
+	newVs     []group.Element
+	newShares []*vssShare
+	vDecommit []byte // commitElements decommit bytes (kept for round 3 broadcast)
 
 	// New committee round-4 state.
 	groupPubKey  group.Element
@@ -225,7 +225,7 @@ func (rs *Resharing) round3Old() {
 	}
 
 	// vDecommit splits into 32-byte chunks: randomness (1 chunk) + threshold+1 element chunks
-	chunks := make([][]byte, 0, (len(rs.vDecommit)/32))
+	chunks := make([][]byte, 0, (len(rs.vDecommit) / 32))
 	for k := 0; k < len(rs.vDecommit); k += 32 {
 		chunks = append(chunks, rs.vDecommit[k:k+32])
 	}

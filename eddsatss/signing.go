@@ -2,11 +2,11 @@ package eddsatss
 
 import (
 	"context"
-	"sync"
 	"crypto/sha512"
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/edwards25519"
 	"github.com/KarpelesLab/tss-lib/v2/common"

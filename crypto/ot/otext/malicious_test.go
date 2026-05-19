@@ -175,7 +175,10 @@ func TestCheckRejectsBitFlippedAfterCommit(t *testing.T) {
 	const l = 64
 	sid := []byte("test-check-flipped-sample")
 
-	flipPositions := []struct{ row, byteIdx int; bitMask byte }{
+	flipPositions := []struct {
+		row, byteIdx int
+		bitMask      byte
+	}{
 		{0, 0, 0x01},
 		{0, 7, 0x80},
 		{63, 3, 0x10},

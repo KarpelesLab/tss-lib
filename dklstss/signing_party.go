@@ -2,11 +2,11 @@ package dklstss
 
 import (
 	"context"
-	"sync"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -24,13 +24,13 @@ import (
 //
 // Lifecycle:
 //
-//   Round 1: broadcast K_i = k_i · G to every other signer.
-//   Round 2: for each peer j (Alice = self, Bob = j), unicast both
-//            ΠMul Alice envelopes (k·ρ and sx·ρ).
-//   Round 3: for each peer j (Alice = j, Bob = self), unicast both
-//            ΠMul Bob responses (corrections + Bob's share contribution).
-//   Round 4: broadcast (φ_i, ŝ_i).
-//   Finalize: aggregate φ and ŝ; compute s = ŝ · φ⁻¹; emit Signature.
+//	Round 1: broadcast K_i = k_i · G to every other signer.
+//	Round 2: for each peer j (Alice = self, Bob = j), unicast both
+//	         ΠMul Alice envelopes (k·ρ and sx·ρ).
+//	Round 3: for each peer j (Alice = j, Bob = self), unicast both
+//	         ΠMul Bob responses (corrections + Bob's share contribution).
+//	Round 4: broadcast (φ_i, ŝ_i).
+//	Finalize: aggregate φ and ŝ; compute s = ŝ · φ⁻¹; emit Signature.
 type SigningParty struct {
 	ctx    context.Context
 	params *tss.Parameters
@@ -40,11 +40,11 @@ type SigningParty struct {
 	ssid   []byte
 
 	// signing subset (sorted PartyIDs; this party is included).
-	subset       tss.SortedPartyIDs
-	myPos        int // index of self within subset
-	otherSubset  []*tss.PartyID
-	subsetIDs    []*big.Int
-	lambdas      []*big.Int
+	subset        tss.SortedPartyIDs
+	myPos         int // index of self within subset
+	otherSubset   []*tss.PartyID
+	subsetIDs     []*big.Int
+	lambdas       []*big.Int
 	sxBySubsetIdx []*big.Int
 
 	// local per-session randomness.

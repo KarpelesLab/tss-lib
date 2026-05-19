@@ -33,10 +33,10 @@ type KeygenRound1Unicast struct {
 // extension setup; reused between every pair of parties twice (once per
 // direction).
 type KeygenOTSetupSenderMsg struct {
-	S          []byte `json:"s"`            // 33-byte compressed point
-	PokAlphaX  []byte `json:"pok_alpha_x"`  // big-endian
-	PokAlphaY  []byte `json:"pok_alpha_y"`  // big-endian
-	PokT       []byte `json:"pok_t"`        // big-endian scalar
+	S         []byte `json:"s"`           // 33-byte compressed point
+	PokAlphaX []byte `json:"pok_alpha_x"` // big-endian
+	PokAlphaY []byte `json:"pok_alpha_y"` // big-endian
+	PokT      []byte `json:"pok_t"`       // big-endian scalar
 }
 
 // KeygenOTSetupReceiverMsg is the base-OT receiver's reply: Kappa
@@ -49,8 +49,8 @@ type KeygenOTSetupReceiverMsg struct {
 // here for documentation; the actual dispatcher will JsonWrap each
 // payload with one of these tags.
 const (
-	KeygenMsgTypeRound1Broadcast    = "dkls:keygen:round1bc"
-	KeygenMsgTypeRound1Unicast      = "dkls:keygen:round1uc"
-	KeygenMsgTypeOTSetupSender      = "dkls:keygen:otsetup:sender"
-	KeygenMsgTypeOTSetupReceiver    = "dkls:keygen:otsetup:receiver"
+	KeygenMsgTypeRound1Broadcast = "dkls:keygen:round1bc"
+	KeygenMsgTypeRound1Unicast   = "dkls:keygen:round1uc"
+	KeygenMsgTypeOTSetupSender   = "dkls:keygen:otsetup:sender"
+	KeygenMsgTypeOTSetupReceiver = "dkls:keygen:otsetup:receiver"
 )
