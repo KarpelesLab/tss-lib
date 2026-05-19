@@ -28,7 +28,14 @@ jobs:
         run: go build ./...
 
       - name: Run tests with coverage
-        run: go test -timeout 30m -race -covermode=atomic -coverprofile=coverage.out ./...
+        # The -race detector adds ~10-20× per-operation overhead. On the
+        # heavy-crypto packages (dklstss runs many OT-extension setups,
+        # base-OT Schnorr proofs, and CT scalar mults per test) the
+        # package suite under -race runs close to wall-clock hour. 30m is
+        # too tight; the previous 30m budget hit timeout consistently after
+        # the recent audit-fix work added more CT primitives. 90m gives
+        # headroom without masking real hangs.
+        run: go test -timeout 90m -race -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@v2
