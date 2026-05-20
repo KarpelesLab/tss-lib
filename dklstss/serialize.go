@@ -23,6 +23,11 @@ import (
 // for backward compatibility; identity material in v2 payloads is
 // silently discarded.
 type keyWireFormat struct {
+	// Format is a string magic field that disambiguates this wire
+	// format from any other JSON document a caller might accidentally
+	// feed to Load. Required for v4+; ignored for v1/v2/v3 loads.
+	Format string `json:"format,omitempty"`
+
 	Version   uint32             `json:"version"`
 	Curve     string             `json:"curve"`
 	N         int                `json:"n"`
@@ -43,6 +48,10 @@ type keyWireFormat struct {
 	LegacyPeerIdentityPubs json.RawMessage `json:"peer_identity_pubs,omitempty"`
 }
 
+// keyFormatMagic is the string written to the Format field of v4+
+// keyWireFormat documents. Load rejects v4+ payloads that don't match.
+const keyFormatMagic = "dklstss-key"
+
 type pairOTWire struct {
 	AsAlice *otext.ExtReceiver `json:"as_alice"`
 	AsBob   *otext.ExtSender   `json:"as_bob"`
@@ -51,13 +60,19 @@ type pairOTWire struct {
 // KeyWireVersion is the format-version constant emitted by Save and
 // required by Load. Bump on incompatible changes.
 //
-// v3 dropped the v2 identity-key fields. Load still accepts v1 and v2
-// (with v2's identity material silently dropped).
-const KeyWireVersion uint32 = 3
+// v3 dropped the v2 identity-key fields. v4 added the Format magic
+// field and a strict curve-identity check at Load. Load still accepts
+// v1, v2, and v3 payloads (the Format check is skipped for those).
+const KeyWireVersion uint32 = 4
 
 // Save serializes the Key to JSON and writes to w. Round-trips with
 // Load. Includes the OT extension setup state (which makes a Key
 // roughly ~50KB for n=3 to ~500KB for n=10).
+//
+// IMPORTANT: the produced JSON is UNENCRYPTED. The OT extension state
+// and the secret share Xi are written in cleartext. Callers are
+// responsible for transport-level confidentiality and integrity (AEAD
+// or detached MAC) over the saved bytes — Save does not.
 func (k *Key) Save(w io.Writer) error {
 	if k == nil {
 		return errors.New("dklstss: Save nil key")
@@ -78,6 +93,7 @@ func (k *Key) Save(w io.Writer) error {
 		ot[i] = &pairOTWire{AsAlice: p.AsAlice, AsBob: p.AsBob}
 	}
 	out := &keyWireFormat{
+		Format:    keyFormatMagic,
 		Version:   KeyWireVersion,
 		Curve:     string(curveName),
 		N:         k.N,
@@ -102,16 +118,30 @@ func Load(r io.Reader) (*Key, error) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, fmt.Errorf("dklstss: Load decode: %w", err)
 	}
-	// v1, v2, and v3 share the same on-disk layout for the protocol
-	// fields. v2 added optional Ed25519 "identity" fields that were
-	// never actually consumed by the broker-driven parties; v3 stops
-	// emitting them but still accepts v1/v2 payloads.
-	if v.Version != KeyWireVersion && v.Version != 1 && v.Version != 2 {
-		return nil, fmt.Errorf("dklstss: Load version mismatch (got %d, expected %d, 2, or 1)", v.Version, KeyWireVersion)
+	// v1, v2, v3, and v4 share the same on-disk layout for the protocol
+	// fields. v2 added optional Ed25519 "identity" fields that were never
+	// actually consumed by the broker-driven parties; v3 stops emitting
+	// them but still accepts v1/v2 payloads. v4 adds the Format magic
+	// field and the strict curve check below.
+	if v.Version != KeyWireVersion && v.Version != 1 && v.Version != 2 && v.Version != 3 {
+		return nil, fmt.Errorf("dklstss: Load version mismatch (got %d, expected one of 1, 2, 3, %d)", v.Version, KeyWireVersion)
+	}
+	if v.Version >= 4 && v.Format != keyFormatMagic {
+		// v4+ payloads must carry the magic string; this disambiguates
+		// a stray JSON document from a real dklstss key blob.
+		return nil, fmt.Errorf("dklstss: Load format magic mismatch (got %q, expected %q)", v.Format, keyFormatMagic)
 	}
 	curve, ok := tss.GetCurveByName(tss.CurveName(v.Curve))
 	if !ok {
 		return nil, fmt.Errorf("dklstss: Load unknown curve %q", v.Curve)
+	}
+	// Enforce that the loaded curve is secp256k1. dklstss is secp256k1-
+	// only; a payload claiming a different curve is either corrupt or
+	// from a different protocol. Fail fast with a clear error rather
+	// than letting ValidateBasic surface an opaque algebraic mismatch
+	// further downstream.
+	if !tss.SameCurve(curve, tss.S256()) {
+		return nil, fmt.Errorf("dklstss: Load curve %q is not secp256k1; dklstss is secp256k1-only", v.Curve)
 	}
 	ot := make([]*PairOTState, len(v.OT))
 	for i, p := range v.OT {

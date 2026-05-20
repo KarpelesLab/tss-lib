@@ -399,6 +399,15 @@ func SignWithPresignDurable(presign *PresignOutput, hash []byte, tweak *big.Int,
 	if store == nil {
 		return nil, errors.New("dklstss: SignWithPresignDurable nil store; use SignWithPresign for in-memory-only")
 	}
+	// Validate hash BEFORE consulting the durable store. An empty or
+	// short hash would otherwise burn an R-hash slot in the caller's
+	// durable backing store on a sign attempt that's destined to fail
+	// (SignWithPresign rejects len(hash) == 0 internally; an empty
+	// hash also collapses the SEC 1 hashToScalar to zero, which is
+	// unsafe for ECDSA). Reject early.
+	if len(hash) == 0 {
+		return nil, errors.New("dklstss: SignWithPresignDurable empty hash")
+	}
 	rHash := presign.RHash()
 	recorded, err := store.CheckAndRecord(rHash)
 	if err != nil {
