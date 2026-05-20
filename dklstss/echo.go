@@ -93,25 +93,79 @@ func verifyEchoes(
 	for _, p := range allParties {
 		byKey[peerKeyStr(p)] = p
 	}
+	// Cap: an echoer cannot legitimately ship more digest entries than
+	// there are parties in allParties. Larger maps are either malformed
+	// or a memory-amplification attempt.
+	maxDigests := len(allParties)
 
 	for n, echoer := range echoers {
 		ec := msgs[n]
 		if ec == nil || ec.Digests == nil {
-			return fmt.Errorf("dklstss: %s echo from %s is empty", source, echoer)
+			return tss.NewError(
+				fmt.Errorf("dklstss: %s echo from %s is empty", source, echoer),
+				source, 0, nil, echoer)
+		}
+		if len(ec.Digests) > maxDigests {
+			return tss.NewError(
+				fmt.Errorf("dklstss: %s echo from %s has %d digests (max %d)",
+					source, echoer, len(ec.Digests), maxDigests),
+				source, 0, nil, echoer)
 		}
 		echoerKey := peerKeyStr(echoer)
+
+		// COVERAGE CHECK (audit HIGH-4 fix): every echoer must report a
+		// digest for every dealer that is part of the protocol's
+		// "all parties" view, except the echoer itself. Missing entries
+		// would otherwise let a malicious dealer + one colluding peer
+		// equivocate to a non-colluding peer who never receives a
+		// contradicting echo.
+		//
+		// Required dealer set is allParties \ {echoer}. For keygen and
+		// refresh, allParties includes self, and the echoer is one of
+		// the other parties — so the required-dealer set is everyone
+		// except the echoer. For resharing, allParties = OLD committee
+		// and the echoer is a NEW-committee member never in allParties
+		// — so allParties \ {echoer} == allParties.
+		expectedDealers := make(map[string]struct{}, len(allParties))
+		for _, p := range allParties {
+			k := peerKeyStr(p)
+			if k == echoerKey {
+				continue
+			}
+			expectedDealers[k] = struct{}{}
+		}
+		for dealerKey := range expectedDealers {
+			if _, ok := ec.Digests[dealerKey]; !ok {
+				dealer := byKey[dealerKey]
+				return tss.NewError(
+					fmt.Errorf("echo from %s omitted dealer %s — would enable an equivocation cover-up",
+						echoer, dealer),
+					source, 0, nil, echoer)
+			}
+		}
+
 		for dealerKey, theirDigest := range ec.Digests {
 			if dealerKey == echoerKey {
-				return fmt.Errorf("dklstss: %s echo from %s contains a self-entry", source, echoer)
+				// Self-entry: echoer attesting to its own commitments
+				// adds no signal. Surface as identifiable abort
+				// against the echoer.
+				return tss.NewError(
+					fmt.Errorf("echo from %s contains a self-entry (protocol violation)", echoer),
+					source, 0, nil, echoer)
 			}
 			mine, ok := myDigests[dealerKey]
 			if !ok {
 				// Echoer mentioned a party we have no view of. With
 				// the echo-set restricted to dealers (the only
 				// parties whose commitments we care about), unknown
-				// keys are protocol noise rather than equivocation
-				// evidence.
-				continue
+				// keys are protocol noise — fail closed and blame
+				// the echoer: a well-formed echo should not contain
+				// keys outside the dealer set.
+				dealer := byKey[dealerKey]
+				return tss.NewError(
+					fmt.Errorf("echo from %s mentions unknown dealer %s (key=%s)",
+						echoer, dealer, dealerKey),
+					source, 0, nil, echoer)
 			}
 			if bytes.Equal(mine, theirDigest) {
 				continue
@@ -126,7 +180,12 @@ func verifyEchoes(
 			}
 			dealer := byKey[dealerKey]
 			if dealer == nil {
-				return fmt.Errorf("dklstss: %s echo from %s disagrees on unknown dealer %s",
+				// dealerKey is in myDigests (so it was in the dealer
+				// set), but the byKey lookup misses it — possible if
+				// the caller's allParties is a STRICT SUBSET that
+				// excludes some dealers. Fall back to a generic error
+				// rather than a misattributed culprit.
+				return fmt.Errorf("dklstss: %s echo from %s disagrees on unmapped dealer %s",
 					source, echoer, dealerKey)
 			}
 			return tss.NewError(
