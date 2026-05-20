@@ -16,6 +16,7 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/frostenc"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
@@ -71,9 +72,16 @@ func TestKeygenRejectsIdentityCommitment(t *testing.T) {
 	_, err = rand.Read(sessionNonce)
 	require.NoError(t, err)
 
+	// Fresh ephemeral X25519 keypair just to satisfy the round-2 wire
+	// length check. The test's failure mode is the identity rejection,
+	// not the EphPub check.
+	_, ephPub, err := frostenc.NewEphemeralKey(rand.Reader)
+	require.NoError(t, err)
+
 	maliciousMsg := &keygenRound1msg{
 		PolyCommitments:    [][]byte{commit0, commit1},
 		SessionNonce:       sessionNonce,
+		EphPub:             ephPub,
 		SchnorrProofAlphaX: alpha.X().Bytes(),
 		SchnorrProofAlphaY: alpha.Y().Bytes(),
 		SchnorrProofT:      r.Bytes(),
@@ -172,9 +180,12 @@ func TestKeygenRejectsNonCanonicalSchnorrT(t *testing.T) {
 	tInflated := new(big.Int).Add(tHonest, q)
 	require.True(t, tInflated.Cmp(q) >= 0, "tInflated must be >= q to exercise the range check")
 
+	_, ephPub, err := frostenc.NewEphemeralKey(rand.Reader)
+	require.NoError(t, err)
 	mal := &keygenRound1msg{
 		PolyCommitments:    [][]byte{frost.EncodeElement(phi0), frost.EncodeElement(phi1)},
 		SessionNonce:       sessionNonce,
+		EphPub:             ephPub,
 		SchnorrProofAlphaX: alpha.X().Bytes(),
 		SchnorrProofAlphaY: alpha.Y().Bytes(),
 		SchnorrProofT:      tInflated.Bytes(),

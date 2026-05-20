@@ -22,6 +22,7 @@ package frosttss
 type keygenRound1msg struct {
 	PolyCommitments    [][]byte `json:"poly_commitments"`
 	SessionNonce       []byte   `json:"session_nonce"`
+	EphPub             []byte   `json:"eph_pub"` // 32-byte X25519 public key for the encrypted round-2 P2P shares.
 	SchnorrProofAlphaX []byte   `json:"schnorr_proof_alpha_x"`
 	SchnorrProofAlphaY []byte   `json:"schnorr_proof_alpha_y"`
 	SchnorrProofT      []byte   `json:"schnorr_proof_t"`
@@ -44,7 +45,15 @@ const keygenScalarBytes = 32
 
 // keygenRound2msg is sent point-to-point in round 2 of the FROST DKG. Each
 // participant sends every other participant their evaluation of the local
-// polynomial at the recipient's identifier: Share = f_i(x_j) mod L.
+// polynomial at the recipient's identifier: f_i(x_j) mod L.
+//
+// As of the encrypted-shares hardening commit, the share is no longer
+// emitted in plaintext: it is sealed under an X25519+HKDF+ChaCha20-Poly1305
+// envelope keyed by the sender's and recipient's ephemeral X25519 keys
+// (broadcast in round 1). Ciphertext is nonce || aead.Seal(...).
+//
+// Associated data: keygenRound2AD(sessionTag, senderPub, recipientPub) —
+// see keygen.go.
 type keygenRound2msg struct {
-	Share []byte `json:"share"`
+	Ciphertext []byte `json:"ciphertext"`
 }

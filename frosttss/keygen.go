@@ -9,6 +9,7 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/frostenc"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/schnorr"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/vss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
@@ -27,6 +28,20 @@ type Keygen struct {
 	a_i_0  *big.Int   // local secret coefficient — retained for the round-1 Schnorr PoK
 	data   *Key
 
+	// Ephemeral X25519 keypair for the round-2 encrypted-share envelope.
+	// Sampled fresh per keygen run. ephPriv is zeroized at finalize.
+	ephPriv []byte
+	ephPub  []byte
+	// peerEphPubs maps each peer's KeyInt().String() to their broadcast
+	// EphPub from round 1, so round 2 can look up the recipient key.
+	peerEphPubs map[string][]byte
+	// peerSessionNonces parallel to peerEphPubs: per-peer SessionNonce
+	// for AD reconstruction in finalize.
+	peerSessionNonces map[string][]byte
+	// mySessionNonce stores the local SessionNonce broadcast in round 1
+	// so round 2 can include it in the associated-data binding.
+	mySessionNonce []byte
+
 	Done chan *Key
 	Err  chan error
 
@@ -34,6 +49,25 @@ type Keygen struct {
 	// the size-1 buffer. See once_send.go for the rationale.
 	doneOnce sync.Once
 	errOnce  sync.Once
+}
+
+// keygenRound2AD constructs the associated-data bytes for the encrypted
+// round-2 share envelope. Binding (sessionNonceOfDealer || senderPub ||
+// recipientPub || tag) makes the ciphertext non-replayable across
+// (run, sender, recipient, label).
+func keygenRound2AD(senderSessionNonce, senderPub, recipientPub []byte) []byte {
+	ad := make([]byte, 0,
+		len("frosttss/keygen/r2/v1|")+
+			len(senderSessionNonce)+
+			len(senderPub)+
+			len(recipientPub)+3)
+	ad = append(ad, []byte("frosttss/keygen/r2/v1|")...)
+	ad = append(ad, senderSessionNonce...)
+	ad = append(ad, '|')
+	ad = append(ad, senderPub...)
+	ad = append(ad, '|')
+	ad = append(ad, recipientPub...)
+	return ad
 }
 
 // NewKeygen starts the FROST Pedersen DKG protocol for this party. Returns
@@ -94,6 +128,20 @@ func (kg *Keygen) round1() error {
 		return fmt.Errorf("rand for session nonce: %w", err)
 	}
 
+	// Sample a fresh ephemeral X25519 keypair. The public component is
+	// broadcast in round 1 and used by every other party to derive a
+	// per-pair AEAD key for the encrypted round-2 P2P share envelope.
+	// Without this, round-2 shares would be sent in cleartext and a
+	// passive eavesdropper plus t-1 corrupted parties could recover the
+	// master secret.
+	ephPriv, ephPub, err := frostenc.NewEphemeralKey(kg.params.Rand())
+	if err != nil {
+		return fmt.Errorf("frostenc.NewEphemeralKey: %w", err)
+	}
+	kg.ephPriv = ephPriv
+	kg.ephPub = ephPub
+	kg.mySessionNonce = sessionNonce
+
 	// Schnorr PoK of a_{i,0} bound to phi_{i,0} = vs[0]. The Session string
 	// encodes the FROST context, the party's identifier, AND the per-keygen
 	// session nonce so cross-party PoK substitution and cross-keygen PoK
@@ -130,6 +178,7 @@ func (kg *Keygen) round1() error {
 	r1msg := &keygenRound1msg{
 		PolyCommitments:    encodedCommitments,
 		SessionNonce:       sessionNonce,
+		EphPub:             ephPub,
 		SchnorrProofAlphaX: pok.Alpha.X().Bytes(),
 		SchnorrProofAlphaY: pok.Alpha.Y().Bytes(),
 		SchnorrProofT:      pok.T.Bytes(),
@@ -157,6 +206,8 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	// Decode and verify each peer's polynomial commitments + Schnorr PoK.
 	N := ec.Params().N
 	peerVs := make([]vss.Vs, len(otherIds))
+	kg.peerEphPubs = make(map[string][]byte, len(otherIds))
+	kg.peerSessionNonces = make(map[string][]byte, len(otherIds))
 	for n, pid := range otherIds {
 		r1 := r1msgs[n]
 		if len(r1.PolyCommitments) != kg.params.Threshold()+1 {
@@ -185,6 +236,16 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 				"frost-keygen-round2", 0, nil, pid)))
 			return
 		}
+		// EphPub length check.
+		if len(r1.EphPub) != frostenc.EphemeralKeyBytes {
+			sendOnce(&kg.errOnce, kg.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent EphPub of length %d (want %d)",
+					pid, len(r1.EphPub), frostenc.EphemeralKeyBytes),
+				"frost-keygen-round2", 0, nil, pid)))
+			return
+		}
+		kg.peerEphPubs[pid.KeyInt().String()] = r1.EphPub
+		kg.peerSessionNonces[pid.KeyInt().String()] = r1.SessionNonce
 		// Length caps on Schnorr proof fields (32-byte Ed25519 scalars and
 		// 32-byte coordinates).
 		if len(r1.SchnorrProofAlphaX) > keygenCommitmentBytes ||
@@ -261,7 +322,14 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	}
 
 	// Send each other party their P2P share. The share for party j is
-	// f_i(x_j) — stored in kg.shares with ID == x_j.
+	// f_i(x_j) — stored in kg.shares with ID == x_j. Encrypted under
+	// the (kg.ephPriv, peer's EphPub) X25519+ChaCha20-Poly1305 envelope
+	// so a passive eavesdropper on the broker cannot recover the share.
+	mySessionNonce, err := kg.findMySessionNonce()
+	if err != nil {
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("internal: %w", err))
+		return
+	}
 	for _, Pj := range otherIds {
 		var shareForPj *big.Int
 		for _, sh := range kg.shares {
@@ -274,7 +342,25 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("internal: missing share for party %s", Pj))
 			return
 		}
-		r2 := &keygenRound2msg{Share: shareForPj.Bytes()}
+		recipientPub, ok := kg.peerEphPubs[Pj.KeyInt().String()]
+		if !ok {
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("internal: missing peer EphPub for %s", Pj))
+			return
+		}
+		ad := keygenRound2AD(mySessionNonce, kg.ephPub, recipientPub)
+		plaintext := shareForPj.Bytes()
+		ct, err := frostenc.SealShare(kg.params.Rand(), kg.ephPriv, recipientPub, ad, plaintext)
+		// Best-effort zeroize the plaintext copy on this goroutine
+		// stack; the original kg.shares[*].Share is left for the
+		// post-finalize zeroize path.
+		for i := range plaintext {
+			plaintext[i] = 0
+		}
+		if err != nil {
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("seal share to %s: %w", Pj, err))
+			return
+		}
+		r2 := &keygenRound2msg{Ciphertext: ct}
 		m := tss.JsonWrap("frost:ed25519:keygen:round2", r2, Pi, Pj)
 		kg.params.Broker().Receive(m)
 	}
@@ -284,6 +370,24 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 		kg.finalize(otherIds, peerVs, ids, msgs)
 	})
 	kg.params.Broker().Connect("frost:ed25519:keygen:round2", rcv)
+}
+
+// findMySessionNonce returns the local party's own SessionNonce that was
+// broadcast in round 1. Stored on the struct at round1-time so round 2
+// can include it in the AD for the encrypted share envelope.
+func (kg *Keygen) findMySessionNonce() ([]byte, error) {
+	if len(kg.mySessionNonce) != keygenSessionNonceLen {
+		return nil, fmt.Errorf("session nonce missing or wrong length")
+	}
+	return kg.mySessionNonce, nil
+}
+
+// peerSessionNonceByID returns the SessionNonce that peer pid broadcast
+// in round 1 (or ok==false if the peer was not in round 1 — should not
+// happen in well-formed protocol flow).
+func (kg *Keygen) peerSessionNonceByID(pid *tss.PartyID) ([]byte, bool) {
+	nonce, ok := kg.peerSessionNonces[pid.KeyInt().String()]
+	return nonce, ok
 }
 
 // finalize verifies received shares against their senders' Feldman commitments,
@@ -307,6 +411,8 @@ func (kg *Keygen) finalize(
 		vsByID[pid.KeyInt().String()] = peerVs[n]
 	}
 
+	_ = r1Ids // peerSessionNonces / peerEphPubs lookups index by KeyInt.
+
 	// Verify each P2P share against its sender's Feldman commitments and
 	// accumulate into our Xi.
 	xi := new(big.Int).Set(kg.shares[PIdx].Share)
@@ -316,7 +422,29 @@ func (kg *Keygen) finalize(
 			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("share from party %s had no matching round-1 commitments", pid))
 			return
 		}
-		shareInt := new(big.Int).SetBytes(r2msgs[n].Share)
+		// Decrypt the share. AD is reconstructed from the sender's
+		// SessionNonce (= sender's peerSessionNonce snapshot in round
+		// 2). Since we don't carry that through to finalize, we look
+		// up via the sessionNonce map keyed by pid.
+		senderSessionNonce, ok := kg.peerSessionNonceByID(pid)
+		if !ok {
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("share from %s: missing peer session nonce", pid))
+			return
+		}
+		senderPub := kg.peerEphPubs[pid.KeyInt().String()]
+		ad := keygenRound2AD(senderSessionNonce, senderPub, kg.ephPub)
+		shareBytes, err := frostenc.OpenShare(kg.ephPriv, senderPub, ad, r2msgs[n].Ciphertext)
+		if err != nil {
+			sendOnce(&kg.errOnce, kg.Err, error(tss.NewError(
+				fmt.Errorf("party %s share ciphertext failed to open: %w", pid, err),
+				"frost-keygen-finalize", 0, nil, pid)))
+			return
+		}
+		shareInt := new(big.Int).SetBytes(shareBytes)
+		// Best-effort zeroize the plaintext bytes immediately.
+		for i := range shareBytes {
+			shareBytes[i] = 0
+		}
 		shareCheck := &vss.Share{
 			Threshold: kg.params.Threshold(),
 			ID:        kg.data.ShareID,
@@ -387,6 +515,11 @@ func (kg *Keygen) finalize(
 	// reference to the dealer's secret coefficient.
 	common.ZeroizeBigInt(kg.a_i_0)
 	kg.a_i_0 = nil
+
+	// Ephemeral X25519 private key is no longer needed once decryption
+	// completes. Wipe it to defend against process-memory disclosure.
+	common.ZeroizeBytes(kg.ephPriv)
+	kg.ephPriv = nil
 
 	sendOnce(&kg.doneOnce, kg.Done, kg.data)
 }
