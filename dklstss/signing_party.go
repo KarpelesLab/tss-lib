@@ -231,12 +231,17 @@ func (sp *SigningParty) round1() error {
 	if err := sp.params.Broker().Receive(bcast); err != nil {
 		return fmt.Errorf("broker r1 bcast: %w", err)
 	}
-	rcv := tss.NewJsonExpect[signR1](signTypeR1, sp.otherSubset, sp.round2)
+	rcv := tss.NewJsonExpect[signR1](signTypeR1, sp.otherSubset, sp.round2KCollect)
 	sp.params.Broker().Connect(signTypeR1, rcv)
 	return nil
 }
 
-func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
+// round2KCollect fires after every other signer's K_j has arrived.
+// Decodes K_j, aggregates R, validates r != 0, then broadcasts a digest
+// map of every party's K (self + peers) as an echo. The echo-cross-
+// check round (round2Echo below) catches a malicious broker that ships
+// different K_i bytes to different recipients with identifiable abort.
+func (sp *SigningParty) round2KCollect(otherIds []*tss.PartyID, msgs []*signR1) {
 	if err := sp.ctx.Err(); err != nil {
 		sendOnce(&sp.errOnce, sp.Err, err)
 		return
@@ -252,7 +257,9 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 			new(big.Int).SetBytes(msgs[n].KiX),
 			new(big.Int).SetBytes(msgs[n].KiY))
 		if err != nil {
-			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("party %s sent invalid K_j: %w", pid, err))
+			sendOnce(&sp.errOnce, sp.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent invalid K_j: %w", pid, err),
+				echoSourceSign, 0, nil, pid)))
 			return
 		}
 		sp.peerK[peerKeyStr(pid)] = Kj
@@ -269,6 +276,68 @@ func (sp *SigningParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 		return
 	}
 	sp.r = r
+
+	// Build my view of every signer's K as a digest map. Each entry is
+	// digest(echoTagSign, dealer=P, [P.K.X, P.K.Y]). Don't include self —
+	// verifyEchoes excludes self-as-dealer (the echoer's "view of itself"
+	// is taken as canonical).
+	digests := make(map[string][]byte, len(otherIds))
+	for _, pid := range otherIds {
+		Kj := sp.peerK[peerKeyStr(pid)]
+		digests[peerKeyStr(pid)] = kIDigest(pid, Kj)
+	}
+	echoOut := &echoMsg{Digests: digests}
+	echoBcast := tss.JsonWrap(signTypeR1Echo, echoOut, Pi, nil)
+	if err := sp.params.Broker().Receive(echoBcast); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r1echo bcast: %w", err))
+		return
+	}
+
+	rcv := tss.NewJsonExpect[echoMsg](signTypeR1Echo, sp.otherSubset,
+		func(ids []*tss.PartyID, msgs []*echoMsgT) {
+			sp.round2Echo(otherIds, ids, msgs)
+		})
+	sp.params.Broker().Connect(signTypeR1Echo, rcv)
+}
+
+// echoMsgT is a type alias so the JsonExpect helper resolves the
+// generic without ambiguity vs. the package-level echoMsg type.
+type echoMsgT = echoMsg
+
+// round2Echo fires after every other signer's echo has arrived. Cross-
+// checks every echo against the local digest view; a disagreement on
+// some K_j surfaces as identifiable abort with the equivocator named in
+// Culprits(). On success, mixes ssid and proceeds with Alice envelopes
+// (the original round2 body).
+func (sp *SigningParty) round2Echo(otherIds, echoers []*tss.PartyID, msgs []*echoMsg) {
+	if err := sp.ctx.Err(); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
+	Pi := sp.params.PartyID()
+
+	// My local digest map for verifyEchoes:
+	//   - For each peer dealer pid: digest of pid's K (computed in
+	//     round2KCollect, recomputed here for clarity).
+	//   - For self: digest of my own K_i.
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	for _, pid := range otherIds {
+		Kj := sp.peerK[peerKeyStr(pid)]
+		myDigests[peerKeyStr(pid)] = kIDigest(pid, Kj)
+	}
+	selfKey := peerKeyStr(Pi)
+	myDigests[selfKey] = kIDigest(Pi, sp.K_i)
+
+	// Echoers are the OTHER signers (sp.otherSubset). The "all parties"
+	// list passed to verifyEchoes is [Pi] ++ otherIds — every party in
+	// the signing subset.
+	all := make([]*tss.PartyID, 0, len(otherIds)+1)
+	all = append(all, Pi)
+	all = append(all, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, echoers, msgs, all, echoSourceSign); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
 
 	// Mix every signer's freshly-sampled K_i into the effective ssid for
 	// round 2+. The OT extension state is reused across signings, so the
@@ -609,11 +678,24 @@ type signR4 struct {
 }
 
 const (
-	signTypeR1 = "dkls:sign:r1"
-	signTypeR2 = "dkls:sign:r2"
-	signTypeR3 = "dkls:sign:r3"
-	signTypeR4 = "dkls:sign:r4"
+	signTypeR1     = "dkls:sign:r1"
+	signTypeR1Echo = "dkls:sign:r1echo" // echo-broadcast phase for K_i equivocation defense
+	signTypeR2     = "dkls:sign:r2"
+	signTypeR3     = "dkls:sign:r3"
+	signTypeR4     = "dkls:sign:r4"
+
+	echoTagSign    = "DKLS23-echo-sign-v1"
+	echoSourceSign = "dklstss-sign"
 )
+
+// kIDigest computes the echo-broadcast digest for one party's K_i =
+// k_i*G commitment. Reuses commitDigest with the sign-phase tag.
+// vsBytes is the (X, Y) coordinate pair of K, length-prefixed inside
+// commitDigest so a coordinate swap or unusual byte length would not
+// produce the same digest.
+func kIDigest(dealer *tss.PartyID, K *crypto.ECPoint) []byte {
+	return commitDigest(echoTagSign, dealer, [][]byte{K.X().Bytes(), K.Y().Bytes()})
+}
 
 // encodedExtendMsg is the wire form of otext.ExtendMsg1.
 type encodedExtendMsg struct {

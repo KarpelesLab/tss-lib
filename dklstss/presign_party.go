@@ -165,12 +165,16 @@ func (pp *PresignParty) round1() error {
 	if err := pp.params.Broker().Receive(bcast); err != nil {
 		return fmt.Errorf("broker r1 bcast: %w", err)
 	}
-	rcv := tss.NewJsonExpect[signR1](presignTypeR1, pp.otherSubset, pp.round2)
+	rcv := tss.NewJsonExpect[signR1](presignTypeR1, pp.otherSubset, pp.round2KCollect)
 	pp.params.Broker().Connect(presignTypeR1, rcv)
 	return nil
 }
 
-func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
+// round2KCollect mirrors SigningParty.round2KCollect: collect peer K_j,
+// aggregate R, then broadcast an echo digest of every peer's K so a
+// malicious broker that equivocates K_i to different recipients is
+// caught with identifiable abort.
+func (pp *PresignParty) round2KCollect(otherIds []*tss.PartyID, msgs []*signR1) {
 	if err := pp.ctx.Err(); err != nil {
 		sendOnce(&pp.errOnce, pp.Err, err)
 		return
@@ -185,7 +189,9 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 			new(big.Int).SetBytes(msgs[n].KiX),
 			new(big.Int).SetBytes(msgs[n].KiY))
 		if err != nil {
-			sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("party %s sent invalid K_j: %w", pid, err))
+			sendOnce(&pp.errOnce, pp.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent invalid K_j: %w", pid, err),
+				echoSourcePresign, 0, nil, pid)))
 			return
 		}
 		pp.peerK[peerKeyStr(pid)] = Kj
@@ -203,6 +209,48 @@ func (pp *PresignParty) round2(otherIds []*tss.PartyID, msgs []*signR1) {
 		return
 	}
 	pp.r = r
+
+	digests := make(map[string][]byte, len(otherIds))
+	for _, pid := range otherIds {
+		digests[peerKeyStr(pid)] = kIDigest(pid, pp.peerK[peerKeyStr(pid)])
+	}
+	echoOut := &echoMsg{Digests: digests}
+	echoBcast := tss.JsonWrap(presignTypeR1Echo, echoOut, Pi, nil)
+	if err := pp.params.Broker().Receive(echoBcast); err != nil {
+		sendOnce(&pp.errOnce, pp.Err, fmt.Errorf("broker r1echo bcast: %w", err))
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](presignTypeR1Echo, pp.otherSubset,
+		func(ids []*tss.PartyID, msgs []*echoMsg) {
+			pp.round2Echo(otherIds, ids, msgs)
+		})
+	pp.params.Broker().Connect(presignTypeR1Echo, rcv)
+}
+
+// round2Echo verifies every peer's echo digest map; on disagreement the
+// equivocator goes into Culprits(). On success: mix ssid, send Alice
+// envelopes (the original round2 body).
+func (pp *PresignParty) round2Echo(otherIds, echoers []*tss.PartyID, msgs []*echoMsg) {
+	if err := pp.ctx.Err(); err != nil {
+		sendOnce(&pp.errOnce, pp.Err, err)
+		return
+	}
+	Pi := pp.params.PartyID()
+
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	for _, pid := range otherIds {
+		myDigests[peerKeyStr(pid)] = kIDigest(pid, pp.peerK[peerKeyStr(pid)])
+	}
+	selfKey := peerKeyStr(Pi)
+	myDigests[selfKey] = kIDigest(Pi, pp.K_i)
+
+	all := make([]*tss.PartyID, 0, len(otherIds)+1)
+	all = append(all, Pi)
+	all = append(all, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, echoers, msgs, all, echoSourcePresign); err != nil {
+		sendOnce(&pp.errOnce, pp.Err, err)
+		return
+	}
 
 	// Mix every signer's K_i into the effective ssid so the OT-extension
 	// sid varies per presign call — required to keep the per-call PRG
@@ -382,7 +430,10 @@ func presignSession(params *tss.Parameters, key *Key, subset tss.SortedPartyIDs)
 }
 
 const (
-	presignTypeR1 = "dkls:presign:r1"
-	presignTypeR2 = "dkls:presign:r2"
-	presignTypeR3 = "dkls:presign:r3"
+	presignTypeR1     = "dkls:presign:r1"
+	presignTypeR1Echo = "dkls:presign:r1echo" // echo-broadcast phase for K_i equivocation defense
+	presignTypeR2     = "dkls:presign:r2"
+	presignTypeR3     = "dkls:presign:r3"
+
+	echoSourcePresign = "dklstss-presign"
 )
