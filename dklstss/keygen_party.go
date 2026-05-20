@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
-	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -53,7 +52,8 @@ type KeygenParty struct {
 	// per recipient). The echo phase cannot run until BOTH halves are
 	// complete; r1JoinCount goes 0 → 1 → 2 and the goroutine that
 	// increments to 2 drives the transition.
-	r1JoinCount atomic.Int32
+	r1Mu        sync.Mutex
+	r1JoinCount int
 	r1Bcasts    []*keygenR1Bcast
 	r1Unicasts  []*keygenR1Unicast
 	r1OtherIds  []*tss.PartyID
@@ -192,8 +192,12 @@ func (kg *KeygenParty) round1() error {
 // It and onR1Unicast race for the second-to-complete spot; the winner
 // fires the echo phase.
 func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast) {
+	kg.r1Mu.Lock()
 	kg.r1Bcasts = msgs
-	if kg.r1JoinCount.Add(1) == 2 {
+	kg.r1JoinCount++
+	ready := kg.r1JoinCount == 2
+	kg.r1Mu.Unlock()
+	if ready {
 		kg.startEchoPhase(otherIds)
 	}
 }
@@ -201,8 +205,12 @@ func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast)
 // onR1Unicast collects the unicast half of round 1 (per-peer share +
 // OT-base-sender). See onR1Bcast for the join semantics.
 func (kg *KeygenParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*keygenR1Unicast) {
+	kg.r1Mu.Lock()
 	kg.r1Unicasts = msgs
-	if kg.r1JoinCount.Add(1) == 2 {
+	kg.r1JoinCount++
+	ready := kg.r1JoinCount == 2
+	kg.r1Mu.Unlock()
+	if ready {
 		kg.startEchoPhase(otherIds)
 	}
 }

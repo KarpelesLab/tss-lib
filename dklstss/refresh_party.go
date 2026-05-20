@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
-	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -59,7 +58,8 @@ type RefreshParty struct {
 	// complete. The atomic counter goes 0 → 1 → 2 and the goroutine
 	// that reaches 2 drives the transition. See dklstss/keygen_party.go
 	// for the rationale (H-3 equivocation defense + echo-broadcast).
-	r1JoinCount atomic.Int32
+	r1Mu        sync.Mutex
+	r1JoinCount int
 	r1Bcasts    []*refreshR1Bcast
 	r1Unicasts  []*refreshR1Unicast
 	r1OtherIds  []*tss.PartyID
@@ -176,15 +176,23 @@ func (rp *RefreshParty) round1() error {
 // onR1Bcast / onR1Unicast: see keygen_party.go for the join semantics.
 // The second to complete fires the echo phase, not round2.
 func (rp *RefreshParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*refreshR1Bcast) {
+	rp.r1Mu.Lock()
 	rp.r1Bcasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(otherIds)
 	}
 }
 
 func (rp *RefreshParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*refreshR1Unicast) {
+	rp.r1Mu.Lock()
 	rp.r1Unicasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(otherIds)
 	}
 }

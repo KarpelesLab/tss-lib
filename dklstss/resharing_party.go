@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
-	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -80,7 +79,8 @@ type ResharingParty struct {
 	// unicast. The echo phase cannot run until both halves arrive from
 	// every OLD participant; the atomic counter goes 0 → 1 → 2 and the
 	// goroutine that reaches 2 fires the echo phase.
-	r1JoinCount atomic.Int32
+	r1Mu        sync.Mutex
+	r1JoinCount int
 	r1Bcasts    []*reshareR1Bcast
 	r1Unicasts  []*reshareR1Unicast
 	r1OldIds    []*tss.PartyID
@@ -326,15 +326,23 @@ func (rp *ResharingParty) oldRound1() error {
 // agreement among NEW-side parties about every OLD dealer's
 // commitments.
 func (rp *ResharingParty) onR1Bcast(oldIds []*tss.PartyID, msgs []*reshareR1Bcast) {
+	rp.r1Mu.Lock()
 	rp.r1Bcasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(oldIds)
 	}
 }
 
 func (rp *ResharingParty) onR1Unicast(oldIds []*tss.PartyID, msgs []*reshareR1Unicast) {
+	rp.r1Mu.Lock()
 	rp.r1Unicasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(oldIds)
 	}
 }

@@ -101,11 +101,26 @@
 //     prescribe a storage backend — that is the caller's responsibility.
 //   - Identifiable abort surfaces ONLY for cryptographically-detectable
 //     deviations: a malicious Bob who uses inconsistent β across the two
-//     parallel ΠMul runs is caught by SignChecked and the deviating
-//     PartyID is returned in the *tss.Error's Culprits(). Transport-level
-//     equivocation (a peer that sends different messages to different
-//     recipients) is the caller's problem — bind it at the
-//     tss.MessageBroker layer.
+//     parallel ΠMul runs is caught by SignChecked (synchronous) or
+//     CheckedSigningParty (broker-driven) and the deviating PartyID is
+//     returned in the *tss.Error's Culprits(). Transport-level
+//     equivocation of K_i is caught by the echo-broadcast phase in
+//     SigningParty.round2KCollect / PresignParty.round2KCollect with
+//     N >= 3 signers; with N = 2 the protocol can detect but not
+//     attribute. Other transport-level equivocation classes remain the
+//     caller's responsibility — bind them at the tss.MessageBroker
+//     layer.
+//
+// # ChainCode privacy
+//
+// The BIP32 chain code attached to every Key is a DETERMINISTIC function
+// of the joint public key (see deriveChainCode). It is NOT a per-DKG
+// secret. Anyone who knows the joint pub can recompute the chain code
+// and derive every non-hardened descendant address — a deliberate
+// departure from BIP32's "chain code is a shared secret" assumption.
+// Implication: descendants of a DKLs23 key are PUBLICLY DERIVABLE.
+// Hardened HD derivation (which would close this gap) is unsupported.
+// For descendant privacy, generate a fresh DKG per identity.
 //
 // References:
 //   - J. Doerner, Y. Kondi, E. Lee, A. Shelat. "Threshold ECDSA in Three
