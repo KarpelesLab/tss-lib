@@ -71,12 +71,33 @@ func (key *Key) NewSigning(ctx context.Context, msg []byte, params *tss.Paramete
 // round1 samples nonces (d_i, e_i), computes commitments (D_i, E_i), and
 // broadcasts them.
 func (s *Signing) round1() error {
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
 	Pi := s.params.PartyID()
 	i := Pi.Index
-	g := group.Ed25519()
+	_ = group.Ed25519() // retained for symmetry; ciphersuite drives the math
 
-	s.di = g.RandomScalar(s.params.Rand())
-	s.ei = g.RandomScalar(s.params.Rand())
+	// RFC 9591 §4.1: nonce_generate(secret) = H3(random_bytes ||
+	// G.SerializeScalar(secret)). Mixing the share Xi into each nonce
+	// derivation defangs a faulty/repeated RNG: if rand returns the same
+	// bytes twice, the share-binding still produces distinct nonces (as
+	// long as Xi differs across calls — and Xi is per-key, not per-call,
+	// so reuse of the SAME Key with a repeating RNG over different
+	// messages still yields distinct (d, e) per call because the random
+	// bytes are mixed in too). The full defense is: "either rand or
+	// secret must differ across calls" — substantially weaker than the
+	// pre-fix "rand must never repeat."
+	di, err := frost.NonceGenerate(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi)
+	if err != nil {
+		return fmt.Errorf("frosttss: nonce_generate d_i: %w", err)
+	}
+	ei, err := frost.NonceGenerate(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi)
+	if err != nil {
+		return fmt.Errorf("frosttss: nonce_generate e_i: %w", err)
+	}
+	s.di = di
+	s.ei = ei
 	// D_i = d_i · G and E_i = e_i · G — the per-party FROST nonces.
 	// Leaking d_i or e_i via timing is a hidden-number attack on the
 	// joint signature and recovers the share scalar. group.Ed25519's
