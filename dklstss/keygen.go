@@ -103,7 +103,19 @@ func Keygen(n, t int, partyIDs tss.SortedPartyIDs, rng io.Reader) ([]*Key, error
 	}
 
 	// Phase 4: pairwise OT setup.
-	sidPrefix := append([]byte("DKLS23-dkg-otsetup-v1-"), pub.X().Bytes()...)
+	// sid binding: tag || pub.X || 0x00 || pub.Y. Mirrors
+	// deriveChainCode's two-coordinate hashing. Binding to both
+	// coordinates (rather than just X) ensures that two DKGs that
+	// coincidentally produce the same X coordinate — extremely
+	// unlikely on secp256k1, but cryptographically possible — derive
+	// distinct OT sids. Bumped tag from v1 to v2 to force incompatible
+	// sids vs prior runs (acceptable per pre-production status).
+	sidPrefix := make([]byte, 0,
+		len("DKLS23-dkg-otsetup-v2-")+len(pub.X().Bytes())+1+len(pub.Y().Bytes()))
+	sidPrefix = append(sidPrefix, []byte("DKLS23-dkg-otsetup-v2-")...)
+	sidPrefix = append(sidPrefix, pub.X().Bytes()...)
+	sidPrefix = append(sidPrefix, 0x00)
+	sidPrefix = append(sidPrefix, pub.Y().Bytes()...)
 	ot, err := setupPairs(n, sidPrefix, rng)
 	if err != nil {
 		return nil, fmt.Errorf("dklstss: Keygen OT setup: %w", err)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/ctmul"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/ot/otext"
@@ -150,4 +151,30 @@ func (k *Key) ValidateBasic() error {
 		return errors.New("dklstss: Xi · G does not equal BigXj[Idx] — share / public-commitment binding broken")
 	}
 	return nil
+}
+
+// Zeroize overwrites the secret material in k — the Shamir share Xi, the
+// HD chain code, and the long-term OT-extension state of every peer pair —
+// with zeros. The Key is unusable for signing/refresh/reshare after this
+// call and is safe to discard.
+//
+// Best-effort: Go's GC may have already relocated copies of the secret to
+// other allocations we cannot reach. Defense-in-depth, not a guarantee.
+// Pair with process isolation, swap-off, and core-dump suppression for
+// stronger erasure.
+//
+// Safe to call on a nil receiver (no-op).
+func (k *Key) Zeroize() {
+	if k == nil {
+		return
+	}
+	common.ZeroizeBigInt(k.Xi)
+	common.ZeroizeBytes(k.ChainCode)
+	for _, pair := range k.OT {
+		if pair == nil {
+			continue
+		}
+		pair.AsAlice.Zeroize()
+		pair.AsBob.Zeroize()
+	}
 }

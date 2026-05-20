@@ -11,6 +11,7 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	cmts "github.com/KarpelesLab/tss-lib/v2/crypto/commitments"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/frost"
+	"github.com/KarpelesLab/tss-lib/v2/crypto/schnorr"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/vss"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
@@ -30,6 +31,7 @@ type Resharing struct {
 	input  *Key // old committee's key data (nil for pure new members)
 
 	// Round 1 temp (old committee)
+	wi        *big.Int // Lagrange-weighted local share, retained for the round-1 Schnorr PoK
 	newVs     vss.Vs
 	newShares vss.Shares
 	vD        cmts.HashDeCommitment
@@ -45,6 +47,21 @@ type Resharing struct {
 	// the size-1 buffer. See once_send.go for the rationale.
 	doneOnce sync.Once
 	errOnce  sync.Once
+}
+
+// buildResharingPoKSession returns the Session byte string for the
+// round-1 Schnorr PoK on wi. Layout mirrors buildKeygenSession: FROST
+// context || tag || length-prefix(partyKey) || sessionNonce. Distinct
+// "reshare-wi-pok" tag domain-separates from the keygen DKG PoK.
+func buildResharingPoKSession(partyKey *big.Int, sessionNonce []byte) []byte {
+	pkBytes := partyKey.Bytes()
+	out := make([]byte, 0, len(frost.ContextString)+len("reshare-wi-pok")+1+len(pkBytes)+len(sessionNonce))
+	out = append(out, frost.ContextString...)
+	out = append(out, []byte("reshare-wi-pok")...)
+	out = append(out, byte(len(pkBytes)))
+	out = append(out, pkBytes...)
+	out = append(out, sessionNonce...)
+	return out
 }
 
 // NewResharing starts a FROST(Ed25519) resharing protocol. For old committee
@@ -97,6 +114,7 @@ func (rs *Resharing) round1Old() error {
 	if err != nil {
 		return fmt.Errorf("vss.Create: %w", err)
 	}
+	rs.wi = wi // retained for Zeroize on the ctx-cancel / success paths
 
 	flatVis, err := crypto.FlattenECPoints(vi)
 	if err != nil {
@@ -108,9 +126,26 @@ func (rs *Resharing) round1Old() error {
 	rs.newShares = shares
 	rs.vD = vCmt.D
 
+	// Schnorr PoK on wi, bound to vi[0] = wi*G. Plus a fresh per-reshare
+	// session nonce to defang PoK replay across reshare runs.
+	sessionNonce := make([]byte, resharingSessionNonceLen)
+	if _, err := rs.params.Rand().Read(sessionNonce); err != nil {
+		return fmt.Errorf("rand for reshare session nonce: %w", err)
+	}
+	pokSession := buildResharingPoKSession(Pi.KeyInt(), sessionNonce)
+	pok, err := schnorr.NewZKProof(pokSession, wi, vi[0], rs.params.Rand())
+	if err != nil {
+		return fmt.Errorf("schnorr.NewZKProof on wi: %w", err)
+	}
+
 	r1 := &resharingRound1msg{
-		GroupPublicKey: frost.EncodeElement(rs.input.GroupPublicKey),
-		VCommitment:    vCmt.C.Bytes(),
+		GroupPublicKey:     frost.EncodeElement(rs.input.GroupPublicKey),
+		Vi0:                frost.EncodeElement(vi[0]),
+		SessionNonce:       sessionNonce,
+		SchnorrProofAlphaX: pok.Alpha.X().Bytes(),
+		SchnorrProofAlphaY: pok.Alpha.Y().Bytes(),
+		SchnorrProofT:      pok.T.Bytes(),
+		VCommitment:        vCmt.C.Bytes(),
 	}
 
 	newParties := rs.params.NewParties().IDs()
@@ -159,19 +194,93 @@ func (rs *Resharing) round2New(oldIds []*tss.PartyID, r1msgs []*resharingRound1m
 		return
 	}
 	Pi := rs.params.PartyID()
+	ec := rs.params.EC()
+	N := ec.Params().N
 
-	// Verify all old parties agree on the GroupPublicKey.
+	// Verify all old parties agree on the GroupPublicKey AND each dealer's
+	// Vi0 / Schnorr PoK on wi.
 	var pub *crypto.ECPoint
 	for n, msg := range r1msgs {
+		pid := oldIds[n]
 		candidate, err := frost.DecodeElement(msg.GroupPublicKey)
 		if err != nil {
-			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("party %s sent invalid GroupPublicKey: %w", oldIds[n], err))
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent invalid GroupPublicKey: %w", pid, err),
+				"frost-reshare-round2", 0, nil, pid)))
 			return
 		}
 		if pub == nil {
 			pub = candidate
 		} else if !pub.Equals(candidate) {
-			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("party %s sent inconsistent GroupPublicKey", oldIds[n]))
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent inconsistent GroupPublicKey", pid),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+
+		// Length caps + nonce length.
+		if len(msg.SessionNonce) != resharingSessionNonceLen {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent session nonce of length %d (want %d)",
+					pid, len(msg.SessionNonce), resharingSessionNonceLen),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+		if len(msg.Vi0) != keygenCommitmentBytes {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent Vi0 of length %d (want %d)",
+					pid, len(msg.Vi0), keygenCommitmentBytes),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+		if len(msg.SchnorrProofAlphaX) > keygenCommitmentBytes ||
+			len(msg.SchnorrProofAlphaY) > keygenCommitmentBytes ||
+			len(msg.SchnorrProofT) > keygenScalarBytes {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent oversize Schnorr proof field", pid),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+
+		// Decode and identity-reject vi[0].
+		vi0, err := frost.DecodeElement(msg.Vi0)
+		if err != nil {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent invalid Vi0: %w", pid, err),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+		vi0 = vi0.EightInvEight()
+		if vi0.IsIdentity() {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s round-1 Vi0 is the curve identity", pid),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+
+		// Verify Schnorr PoK on wi binding to vi0.
+		alphaX := new(big.Int).SetBytes(msg.SchnorrProofAlphaX)
+		alphaY := new(big.Int).SetBytes(msg.SchnorrProofAlphaY)
+		alpha, err := crypto.NewECPoint(ec, alphaX, alphaY)
+		if err != nil {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s sent invalid Schnorr alpha: %w", pid, err),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+		tScalar := new(big.Int).SetBytes(msg.SchnorrProofT)
+		if tScalar.Cmp(N) >= 0 {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s Schnorr T not canonical (>= L)", pid),
+				"frost-reshare-round2", 0, nil, pid)))
+			return
+		}
+		pokSession := buildResharingPoKSession(pid.KeyInt(), msg.SessionNonce)
+		pok := &schnorr.ZKProof{Alpha: alpha, T: tScalar}
+		if !pok.Verify(pokSession, vi0) {
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s wi PoK verification failed", pid),
+				"frost-reshare-round2", 0, nil, pid)))
 			return
 		}
 	}
@@ -344,6 +453,24 @@ func (rs *Resharing) round4New(
 		for idx, v := range vj {
 			vj[idx] = v.EightInvEight()
 		}
+
+		// Per-dealer cross-check: the round-1 Vi0 (already PoK-verified
+		// in round2New) must match the vi[0] reconstructed from the
+		// round-3 decommitment. A mismatch is dealer equivocation
+		// between round 1 and round 3 — a coalition that signed the PoK
+		// on one wi but then opened a different vi[0] to skew the share
+		// derivation.
+		round1Vi0, err := frost.DecodeElement(r1msg.Vi0)
+		if err == nil {
+			round1Vi0 = round1Vi0.EightInvEight()
+		}
+		if err != nil || !round1Vi0.Equals(vj[0]) {
+			pid := allOldIds[j]
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("party %s round-1 Vi0 disagrees with round-3 vi[0] (equivocation)", pid),
+				"frost-reshare-round4", 0, nil, pid)))
+			return
+		}
 		vjc[j] = vj
 
 		sharej := &vss.Share{
@@ -352,7 +479,10 @@ func (rs *Resharing) round4New(
 			Share:     new(big.Int).SetBytes(r3msg1.Share),
 		}
 		if !sharej.Verify(ec, rs.params.NewThreshold(), vj) {
-			sendOnce(&rs.errOnce, rs.Err, fmt.Errorf("VSS share verification failed for old party %d", j))
+			pid := allOldIds[j]
+			sendOnce(&rs.errOnce, rs.Err, error(tss.NewError(
+				fmt.Errorf("VSS share verification failed for old party %s", pid),
+				"frost-reshare-round4", 0, nil, pid)))
 			return
 		}
 		newXi = new(big.Int).Add(newXi, sharej.Share)
@@ -436,12 +566,20 @@ func (rs *Resharing) round4New(
 }
 
 func (rs *Resharing) round5Old() {
+	// Zeroize BEFORE the ctx-err early return. An attacker racing a ctx
+	// cancel after round 3 (when shares are already on the wire) would
+	// otherwise leave the old Xi resident on the heap while the new
+	// committee already possesses the resharing data — defeating the
+	// proactive-security claim. Always scrub on entry.
+	if rs.input != nil {
+		common.ZeroizeBigInt(rs.input.Xi)
+	}
+	common.ZeroizeBigInt(rs.wi)
+	rs.wi = nil
+
 	if rs.ctx.Err() != nil {
 		sendOnce(&rs.errOnce, rs.Err, rs.ctx.Err())
 		return
-	}
-	if rs.input != nil {
-		rs.input.Xi.SetInt64(0)
 	}
 	if rs.params.IsNewCommittee() && rs.round5NewKey != nil {
 		sendOnce(&rs.doneOnce, rs.Done, rs.round5NewKey)

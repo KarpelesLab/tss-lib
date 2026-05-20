@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/elliptic"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
 	"sync"
-	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -52,7 +52,8 @@ type KeygenParty struct {
 	// per recipient). The echo phase cannot run until BOTH halves are
 	// complete; r1JoinCount goes 0 → 1 → 2 and the goroutine that
 	// increments to 2 drives the transition.
-	r1JoinCount atomic.Int32
+	r1Mu        sync.Mutex
+	r1JoinCount int
 	r1Bcasts    []*keygenR1Bcast
 	r1Unicasts  []*keygenR1Unicast
 	r1OtherIds  []*tss.PartyID
@@ -191,8 +192,12 @@ func (kg *KeygenParty) round1() error {
 // It and onR1Unicast race for the second-to-complete spot; the winner
 // fires the echo phase.
 func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast) {
+	kg.r1Mu.Lock()
 	kg.r1Bcasts = msgs
-	if kg.r1JoinCount.Add(1) == 2 {
+	kg.r1JoinCount++
+	ready := kg.r1JoinCount == 2
+	kg.r1Mu.Unlock()
+	if ready {
 		kg.startEchoPhase(otherIds)
 	}
 }
@@ -200,8 +205,12 @@ func (kg *KeygenParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*keygenR1Bcast)
 // onR1Unicast collects the unicast half of round 1 (per-peer share +
 // OT-base-sender). See onR1Bcast for the join semantics.
 func (kg *KeygenParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*keygenR1Unicast) {
+	kg.r1Mu.Lock()
 	kg.r1Unicasts = msgs
-	if kg.r1JoinCount.Add(1) == 2 {
+	kg.r1JoinCount++
+	ready := kg.r1JoinCount == 2
+	kg.r1Mu.Unlock()
+	if ready {
 		kg.startEchoPhase(otherIds)
 	}
 }
@@ -512,7 +521,16 @@ const (
 
 func keygenSession(params *tss.Parameters) []byte {
 	h := sha256.New()
-	h.Write([]byte("DKLS23-keygen-party-v1-"))
+	h.Write([]byte("DKLS23-keygen-party-v2-"))
+	// Bind the threshold T into the session hash. resharingSession
+	// already includes it (resharing_party.go); the keygen and refresh
+	// variants previously omitted it. Two DKG runs with the same party
+	// set but different T (e.g., migrating 2-of-3 → 3-of-3 with the
+	// same parties) would otherwise share an ssid and could collide
+	// the per-pair OT sids that derive from it.
+	var thBuf [4]byte
+	binary.BigEndian.PutUint32(thBuf[:], uint32(params.Threshold()))
+	h.Write(thBuf[:])
 	for _, p := range params.Parties().IDs() {
 		h.Write(p.KeyInt().Bytes())
 		h.Write([]byte{0})

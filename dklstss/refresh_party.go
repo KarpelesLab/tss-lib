@@ -3,11 +3,11 @@ package dklstss
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
 	"sync"
-	"sync/atomic"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
@@ -58,7 +58,8 @@ type RefreshParty struct {
 	// complete. The atomic counter goes 0 → 1 → 2 and the goroutine
 	// that reaches 2 drives the transition. See dklstss/keygen_party.go
 	// for the rationale (H-3 equivocation defense + echo-broadcast).
-	r1JoinCount atomic.Int32
+	r1Mu        sync.Mutex
+	r1JoinCount int
 	r1Bcasts    []*refreshR1Bcast
 	r1Unicasts  []*refreshR1Unicast
 	r1OtherIds  []*tss.PartyID
@@ -175,15 +176,23 @@ func (rp *RefreshParty) round1() error {
 // onR1Bcast / onR1Unicast: see keygen_party.go for the join semantics.
 // The second to complete fires the echo phase, not round2.
 func (rp *RefreshParty) onR1Bcast(otherIds []*tss.PartyID, msgs []*refreshR1Bcast) {
+	rp.r1Mu.Lock()
 	rp.r1Bcasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(otherIds)
 	}
 }
 
 func (rp *RefreshParty) onR1Unicast(otherIds []*tss.PartyID, msgs []*refreshR1Unicast) {
+	rp.r1Mu.Lock()
 	rp.r1Unicasts = msgs
-	if rp.r1JoinCount.Add(1) == 2 {
+	rp.r1JoinCount++
+	ready := rp.r1JoinCount == 2
+	rp.r1Mu.Unlock()
+	if ready {
 		rp.startEchoPhase(otherIds)
 	}
 }
@@ -533,18 +542,28 @@ const (
 )
 
 func refreshSession(params *tss.Parameters, key *Key) []byte {
-	// Bound to (pub, party set). The base-OT setup that follows each
-	// refresh uses pairBaseSid(ssid, ...) for the per-pair sids; even if
-	// two refreshes produce the same ssid (same key + parties), the base
-	// OT messages are randomized internally (fresh y, delta, x_i per
-	// call) and the derived OT-extension seeds are independent across
-	// refreshes — so sid collision here does not break security. Refresh
-	// also does NOT run signing-time ΠMul, so the per-call PRG sid
-	// binding in crypto/ot/otext is not exercised at refresh time.
+	// Bound to (pub, party set, threshold). The base-OT setup that
+	// follows each refresh uses pairBaseSid(ssid, ...) for the per-pair
+	// sids; even if two refreshes produce the same ssid (same key +
+	// parties + T), the base OT messages are randomized internally
+	// (fresh y, delta, x_i per call) and the derived OT-extension
+	// seeds are independent across refreshes — so sid collision here
+	// does not break security. Refresh also does NOT run signing-time
+	// ΠMul, so the per-call PRG sid binding in crypto/ot/otext is not
+	// exercised at refresh time.
+	//
+	// We mix the threshold T (and bump the tag from v1 → v2) for
+	// parity with the keygen and reshare session hashes and to
+	// defend against an exotic ssid-collision scenario when refresh
+	// is run twice over the same (key, parties) with different T —
+	// which the existing API permits via params.Threshold().
 	h := sha256.New()
-	h.Write([]byte("DKLS23-refresh-party-v1-"))
+	h.Write([]byte("DKLS23-refresh-party-v2-"))
 	h.Write(key.ECDSAPub.X().Bytes())
 	h.Write(key.ECDSAPub.Y().Bytes())
+	var thBuf [4]byte
+	binary.BigEndian.PutUint32(thBuf[:], uint32(params.Threshold()))
+	h.Write(thBuf[:])
 	for _, p := range params.Parties().IDs() {
 		h.Write(p.KeyInt().Bytes())
 		h.Write([]byte{0})

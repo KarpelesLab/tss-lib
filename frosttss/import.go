@@ -78,9 +78,9 @@ func ImportKey(priv *big.Int, partyID *tss.PartyID) (*Key, error) {
 		BigXj:          []*crypto.ECPoint{pub},
 		GroupPublicKey: pub,
 	}
-	// frosttss.Key has no ValidateBasic; do the basic sanity checks here.
-	if key.GroupPublicKey == nil || !key.GroupPublicKey.ValidateBasic() {
-		return nil, fmt.Errorf("frosttss.ImportKey: derived GroupPublicKey is not a valid curve point")
+	// Comprehensive sanity check using the freshly-added Key.ValidateBasic.
+	if err := key.ValidateBasic(); err != nil {
+		return nil, fmt.Errorf("frosttss.ImportKey: %w", err)
 	}
 	return key, nil
 }
