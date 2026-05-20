@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
@@ -69,4 +70,23 @@ func (key *Key) SubsetForParties(sortedIDs tss.SortedPartyIDs) (*Key, error) {
 		subset.BigXj[j] = key.BigXj[savedIdx]
 	}
 	return subset, nil
+}
+
+// Zeroize overwrites the secret material in k — the Shamir share Xi — with
+// zeros. The Key is unusable for signing or resharing after this call and
+// is safe to discard.
+//
+// Best-effort like all in-process zeroization on a garbage-collected
+// runtime: copies that the GC has already relocated cannot be reached.
+// Pair with process isolation, swap-off, and core-dump suppression for
+// stronger erasure.
+//
+// Safe to call on a nil receiver (no-op). Note: subsets produced by
+// SubsetForParties share the Xi pointer with their parent; zeroizing
+// either clears both.
+func (k *Key) Zeroize() {
+	if k == nil {
+		return
+	}
+	common.ZeroizeBigInt(k.Xi)
 }

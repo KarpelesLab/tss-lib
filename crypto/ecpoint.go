@@ -31,6 +31,7 @@ type ECPoint struct {
 var (
 	eight    = big.NewInt(8)
 	eightInv = new(big.Int).ModInverse(eight, edwards25519.Edwards().Params().N)
+	oneBig   = big.NewInt(1)
 )
 
 // Creates a new ECPoint and checks that the given coordinates are on the elliptic curve.
@@ -134,6 +135,35 @@ func (p *ECPoint) SetCurve(curve elliptic.Curve) *ECPoint {
 // ValidateBasic checks that the point is non-nil, has non-nil coordinates, and lies on its curve.
 func (p *ECPoint) ValidateBasic() bool {
 	return p != nil && p.coords[0] != nil && p.coords[1] != nil && p.IsOnCurve()
+}
+
+// IsIdentity reports whether the point is the group identity (point at
+// infinity). Affine representations differ by curve family:
+//
+//   - Short Weierstrass curves (secp256k1, NIST P-256, …): identity is
+//     conventionally (0, 0) and is NOT on the curve, so a point constructed
+//     via NewECPoint cannot be the identity. NewECPointNoCurveCheck
+//     callers and unmarshalled wire bytes are the only paths that can
+//     deposit a (0, 0) into an ECPoint; this helper catches those.
+//   - Twisted Edwards curves (Ed25519): identity is (0, 1) and IS on the
+//     curve. This helper detects it.
+//
+// Returns false for a nil receiver.
+func (p *ECPoint) IsIdentity() bool {
+	if p == nil || p.coords[0] == nil || p.coords[1] == nil {
+		return false
+	}
+	if p.coords[0].Sign() != 0 {
+		return false
+	}
+	// X = 0; identity if Y is also 0 (short-Weierstrass) or 1 (twisted-Edwards).
+	if p.coords[1].Sign() == 0 {
+		return true
+	}
+	if p.coords[1].Cmp(oneBig) == 0 {
+		return true
+	}
+	return false
 }
 
 // EightInvEight multiplies the point by 8 and then by the modular inverse of 8 (used for cofactor clearing on Ed25519).

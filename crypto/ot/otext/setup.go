@@ -87,6 +87,48 @@ func (s *ExtSender) Delta() [DeltaBytes]byte {
 	return out
 }
 
+// Zeroize overwrites the sender's long-term secret state (Δ and the κ
+// base-OT seeds) with zeros. After Zeroize the receiver cannot be used
+// for further Extend invocations and is safe to discard.
+//
+// Best-effort like all in-process zeroization on a garbage-collected
+// runtime: copies that the GC has already relocated cannot be reached.
+// Safe to call on a nil receiver.
+func (s *ExtSender) Zeroize() {
+	if s == nil {
+		return
+	}
+	for i := range s.delta {
+		s.delta[i] = 0
+	}
+	for j := range s.seeds {
+		for i := range s.seeds[j] {
+			s.seeds[j][i] = 0
+		}
+	}
+}
+
+// Zeroize overwrites the receiver's long-term secret state (the two
+// per-instance seed arrays) with zeros. After Zeroize the receiver
+// cannot be used for further Extend invocations and is safe to discard.
+//
+// Safe to call on a nil receiver.
+func (r *ExtReceiver) Zeroize() {
+	if r == nil {
+		return
+	}
+	for j := range r.seeds0 {
+		for i := range r.seeds0[j] {
+			r.seeds0[j][i] = 0
+		}
+	}
+	for j := range r.seeds1 {
+		for i := range r.seeds1[j] {
+			r.seeds1[j][i] = 0
+		}
+	}
+}
+
 // validateExtendInputs is a small helper shared by Extend on both sides.
 func validateExtendInputs(l int) error {
 	if l <= 0 {
