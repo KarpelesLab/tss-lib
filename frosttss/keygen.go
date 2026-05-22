@@ -509,6 +509,11 @@ func (kg *Keygen) finalize(
 		return
 	}
 	kg.data.GroupPublicKey = pub
+	// Master chain code = SHA-256(domain || EncodeElement(pub)).
+	// Deterministic from the joint pubkey, so every party computes the
+	// same value with no extra communication. Enables non-hardened HD
+	// derivation via Key.DeriveChild.
+	kg.data.ChainCode = DeriveChainCode(pub)
 
 	// a_i_0 is no longer needed; scrub it before returning. Best-effort
 	// (Go GC may have copied), but at minimum we don't pin a long-lived
