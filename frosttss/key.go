@@ -12,10 +12,19 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
 
-// KeyVersion is the schema version of a frosttss Key. Currently 1.
+// KeyVersion is the schema version of a frosttss Key. Currently 2.
 // Bump on incompatible field-layout changes; readers should refuse
 // values they don't understand.
-const KeyVersion uint32 = 1
+//
+// Version history:
+//   - 1: Xi, ShareID, Ks, BigXj, GroupPublicKey.
+//   - 2: + ChainCode (32-byte BIP32-shape value enabling non-hardened
+//     HD derivation via DeriveChild). Backward compatible at the
+//     struct level — ChainCode is optional and ValidateBasic
+//     tolerates absence; legacy Version-1 Keys can be upgraded with
+//     AttachChainCode (the chain code is a deterministic function of
+//     GroupPublicKey).
+const KeyVersion uint32 = 2
 
 // Key represents a single participant's share of a FROST(Ed25519, SHA-512) key.
 //
@@ -34,6 +43,21 @@ type Key struct {
 	Ks             []*big.Int
 	BigXj          []*crypto.ECPoint
 	GroupPublicKey *crypto.ECPoint
+
+	// ChainCode is the 32-byte BIP32-shape chain code at this Key's
+	// position in the derivation tree. For a Key produced by NewKeygen,
+	// NewResharing, or ImportKey, ChainCode is the master chain code
+	// (DeriveChainCode(GroupPublicKey)). For a Key passed to
+	// DeriveChild it is the chain code at the path terminus. It is
+	// optional — legacy Keys produced before HD support landed leave
+	// it nil, and the rest of the protocol does not consume it. Call
+	// AttachChainCode on a legacy Key to populate it from the public
+	// key.
+	//
+	// ChainCode is a deterministic function of GroupPublicKey, hence
+	// publicly enumerable. See doc.go "ChainCode privacy" for the
+	// privacy implications.
+	ChainCode []byte
 }
 
 // ValidateBasic returns nil if the Key is internally consistent. Checks:
@@ -89,6 +113,13 @@ func (k *Key) ValidateBasic() error {
 	expect := crypto.CTScalarBaseMultEd25519(frost.EdwardsCurve(), k.Xi)
 	if !expect.Equals(k.BigXj[myIdx]) {
 		return errors.New("frosttss: Xi · G does not equal BigXj[ShareID slot] — share / commitment binding broken")
+	}
+	// ChainCode is optional for backward compatibility with Version-1
+	// Keys produced before HD support landed. If present, it must be
+	// exactly 32 bytes — anything else signals a mis-deserialized or
+	// hand-constructed Key and we refuse to operate on it.
+	if k.ChainCode != nil && len(k.ChainCode) != 32 {
+		return fmt.Errorf("frosttss: ChainCode set but length %d != 32", len(k.ChainCode))
 	}
 	return nil
 }
@@ -153,4 +184,9 @@ func (k *Key) Zeroize() {
 		return
 	}
 	common.ZeroizeBigInt(k.Xi)
+	// ChainCode is not secret (it's a deterministic function of the
+	// public key), but wiping it on Zeroize is consistent with the
+	// "this Key is unusable after Zeroize" contract and matches
+	// dklstss.Key.Zeroize behavior.
+	common.ZeroizeBytes(k.ChainCode)
 }

@@ -26,6 +26,15 @@ type Signing struct {
 	di, ei *big.Int      // hiding and binding scalars
 	Di, Ei group.Element // d_i*G, e_i*G
 
+	// HD derivation tweak (optional). When non-nil, the signature is
+	// produced under the child public key derivedPub = key.GroupPublicKey
+	// + tweak·G. Signer at subset index 0 absorbs the tweak into its
+	// λ·s mul-add; every party uses derivedPub when computing the FROST
+	// challenge c. Nil for non-HD signings — round flow is otherwise
+	// identical.
+	tweak      *big.Int
+	derivedPub *crypto.ECPoint
+
 	Done chan *SignatureData
 	Err  chan error
 
@@ -43,6 +52,26 @@ type Signing struct {
 //
 // The signing committee size must be at least threshold+1.
 func (key *Key) NewSigning(ctx context.Context, msg []byte, params *tss.Parameters) (*Signing, error) {
+	return key.NewSigningWithTweak(ctx, msg, params, nil)
+}
+
+// NewSigningWithTweak starts a FROST(Ed25519) signing session that
+// produces a signature verifiable under the child public key
+// key.GroupPublicKey + tweak·G. The tweak is the integer returned by
+// DeriveChild for a chosen non-hardened path; passing nil reduces to
+// NewSigning (signature verifies under key.GroupPublicKey).
+//
+// All signing parties must call this with the same tweak value, derived
+// independently from the agreed (path, key) — there is no in-band
+// transport for tweak. Mismatched tweaks across parties produce a
+// signature that fails verification under both parent and child keys
+// and triggers each party's local Ed25519 verify check at finalize.
+//
+// Convention: signer at subset index 0 (lowest ShareID in
+// params.Parties()) absorbs tweak into its λ·s mul-add. The choice is
+// deterministic from the sorted party set, so every party derives it
+// the same way without coordination.
+func (key *Key) NewSigningWithTweak(ctx context.Context, msg []byte, params *tss.Parameters, tweak *big.Int) (*Signing, error) {
 	if !tss.SameCurve(params.EC(), frost.EdwardsCurve()) {
 		return nil, fmt.Errorf("frosttss: FROST(Ed25519) requires the Ed25519 curve")
 	}
@@ -62,10 +91,55 @@ func (key *Key) NewSigning(ctx context.Context, msg []byte, params *tss.Paramete
 		Done:   make(chan *SignatureData, 1),
 		Err:    make(chan error, 1),
 	}
+	if tweak != nil {
+		// Pre-compute the child public key once, used both for the FROST
+		// challenge in round 2 and the partial-signature / final
+		// verification in finalize.
+		ec := frost.EdwardsCurve()
+		L := ec.Params().N
+		t := new(big.Int).Mod(tweak, L)
+		if t.Sign() == 0 {
+			// Tweak ≡ 0 mod L is equivalent to no tweak; collapse to the
+			// non-HD path to avoid a wasteful empty add.
+			s.tweak = nil
+		} else {
+			deltaG := crypto.CTScalarBaseMultEd25519(ec, t)
+			derived, err := key.GroupPublicKey.Add(deltaG)
+			if err != nil {
+				return nil, fmt.Errorf("frosttss: NewSigningWithTweak: deriving child pubkey: %w", err)
+			}
+			if derived.IsIdentity() {
+				return nil, fmt.Errorf("frosttss: NewSigningWithTweak: tweak collapses child to identity (tweak ≡ -parent_scalar mod L)")
+			}
+			s.tweak = t
+			s.derivedPub = derived
+		}
+	}
 	if err := s.round1(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// DeriveAndSign is a convenience wrapper: it walks the BIP32-shape
+// non-hardened path against key.ChainCode, then starts a signing
+// session under the derived child key.
+//
+// Returns the running *Signing (whose Done emits a SignatureData
+// verifiable under childPub) and the childPub itself, so the caller
+// can hand it to an Ed25519 verifier.
+//
+// Hardened indices in the path return ErrHardenedNotSupported.
+func (key *Key) DeriveAndSign(ctx context.Context, path []uint32, msg []byte, params *tss.Parameters) (*Signing, *crypto.ECPoint, error) {
+	tweak, childPub, _, err := key.DeriveChild(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	sig, err := key.NewSigningWithTweak(ctx, msg, params, tweak)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sig, childPub, nil
 }
 
 // round1 samples nonces (d_i, e_i), computes commitments (D_i, E_i), and
@@ -178,7 +252,15 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 		sendOnce(&s.errOnce, s.Err, fmt.Errorf("ComputeGroupCommitment: %w", err))
 		return
 	}
-	groupPubEl := group.AdaptECPoint(s.key.GroupPublicKey)
+	// Challenge is over the public key the verifier will use: derived
+	// child pubkey when HD-signing, parent group pubkey otherwise.
+	// Every signing party performs this branch identically because tweak
+	// is supplied identically at NewSigningWithTweak.
+	challengePub := s.key.GroupPublicKey
+	if s.tweak != nil {
+		challengePub = s.derivedPub
+	}
+	groupPubEl := group.AdaptECPoint(challengePub)
 	c := frost.ComputeGroupChallenge(cs, R, groupPubEl, s.msg)
 
 	signerIDs := make([]*big.Int, 0, len(commitments))
@@ -187,7 +269,12 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	}
 	lambda_i := frost.LagrangeCoefficient(cs, Pi.KeyInt(), signerIDs)
 
-	// z_i = d_i + e_i · ρ_i + λ_i · s_i · c (mod L)
+	// z_i = d_i + e_i · ρ_i + λ_i · s_i · c (mod L)   [non-HD]
+	// z_0 = d_0 + e_0 · ρ_0 + (λ_0 · s_0 + tweak) · c [HD, signer-0]
+	// z_j = d_j + e_j · ρ_j + λ_j · s_j · c           [HD, signer j>0]
+	//
+	// Σ z_i = d_R + e_R · ρ_R + c · (Σ λ·s + tweak) =
+	//       = d_R + e_R · ρ_R + c · child_priv  ✓
 	//
 	// Both nonces (d_i, e_i) and the share s_i are secret. Composing the
 	// product `λ_i · s_i · c` through math/big.Int.Mul leaks bits of s_i;
@@ -196,14 +283,21 @@ func (s *Signing) round2(otherIds []*tss.PartyID, r1msgs []*signRound1msg) {
 	// crypto.CTScalarMulAddModN (which routes through edwards25519.ScMulAdd
 	// on Ed25519 — the same primitive RFC 8032 stdlib EdDSA uses):
 	//
-	//   t1 = e_i · ρ_i + d_i        (secret · public + secret)
-	//   t2 = λ_i · s_i + 0          (public · secret)
-	//   z_i = t2 · c + t1           (secret · public + secret)
+	//   t1 = e_i · ρ_i + d_i           (secret · public + secret)
+	//   t2 = λ_i · s_i + tweakTerm     (public · secret + public)
+	//   z_i = t2 · c + t1              (secret · public + secret)
+	//
+	// where tweakTerm is `s.tweak` for the signer at subset index 0 and
+	// zero for everyone else. Adding a public scalar (tweak) into the
+	// `+c` slot of CT mul-add does not leak the secret operand.
 	rho_i := bindingFactors[Pi.KeyInt().String()]
 	ec := frost.EdwardsCurve()
-	zero := new(big.Int)
+	tweakTerm := new(big.Int)
+	if s.tweak != nil && Pi.Index == 0 {
+		tweakTerm.Set(s.tweak)
+	}
 	t1 := crypto.CTScalarMulAddModN(ec, s.ei, rho_i, s.di)
-	t2 := crypto.CTScalarMulAddModN(ec, lambda_i, s.key.Xi, zero)
+	t2 := crypto.CTScalarMulAddModN(ec, lambda_i, s.key.Xi, tweakTerm)
 	zi := crypto.CTScalarMulAddModN(ec, t2, c, t1)
 
 	// Broadcast z_i via a single To==nil message (identical per recipient).
@@ -249,6 +343,17 @@ func (s *Signing) finalize(
 		signerIDs = append(signerIDs, cm.Identifier)
 	}
 
+	// HD: subset signer-0 (lowest ShareID) absorbed the tweak. When
+	// verifying that party's partial, the RHS is augmented by c·tweak·G.
+	// Compute the augment point once.
+	var tweakDeltaEl group.Element
+	var signer0ID string
+	if s.tweak != nil {
+		ec := frost.EdwardsCurve()
+		tweakDeltaEl = group.AdaptECPoint(crypto.CTScalarBaseMultEd25519(ec, s.tweak))
+		signer0ID = s.params.Parties().IDs()[0].KeyInt().String()
+	}
+
 	z := new(big.Int).Set(myZi)
 	for n, pid := range r2Ids {
 		zj, err := g.DecodeScalar(r2msgs[n].Z)
@@ -280,6 +385,16 @@ func (s *Signing) finalize(
 			sendOnce(&s.errOnce, s.Err, fmt.Errorf("computing verifier rhs for %s: %w", pid, err))
 			return
 		}
+		// HD signer-0 augmentation: if this peer is the subset's lowest
+		// ShareID, its z_j absorbed `tweak` into λ·s, so its partial
+		// satisfies z_j·G = D_j + ρ_j·E_j + c·(λ·Y_j + tweak·G).
+		if s.tweak != nil && cm.Identifier.String() == signer0ID {
+			rhs, err = rhs.Add(tweakDeltaEl.ScalarMult(c))
+			if err != nil {
+				sendOnce(&s.errOnce, s.Err, fmt.Errorf("computing HD tweak augment for %s: %w", pid, err))
+				return
+			}
+		}
 		if !lhs.Equal(rhs) {
 			sendOnce(&s.errOnce, s.Err, fmt.Errorf("partial signature from %s failed verification", pid))
 			return
@@ -293,10 +408,14 @@ func (s *Signing) finalize(
 	sig = append(sig, rEnc...)
 	sig = append(sig, sEnc...)
 
+	verifyPub := s.key.GroupPublicKey
+	if s.tweak != nil {
+		verifyPub = s.derivedPub
+	}
 	pk := &edwards25519.PublicKey{
 		Curve: s.params.EC(),
-		X:     s.key.GroupPublicKey.X(),
-		Y:     s.key.GroupPublicKey.Y(),
+		X:     verifyPub.X(),
+		Y:     verifyPub.Y(),
 	}
 	rBigInt := leBytesToBigInt(rEnc)
 	sBigInt := leBytesToBigInt(sEnc)

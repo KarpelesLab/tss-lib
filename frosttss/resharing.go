@@ -532,6 +532,12 @@ func (rs *Resharing) round4New(
 	newKey.Ks = newKs
 	newKey.BigXj = newBigXjs
 	newKey.GroupPublicKey = rs.groupPubKey
+	// ChainCode is a deterministic function of the joint public key,
+	// which resharing preserves by construction. Derive it locally
+	// rather than passing it through the protocol (saves a field on
+	// the wire and prevents a malicious old-committee party from
+	// influencing the new committee's chain code).
+	newKey.ChainCode = DeriveChainCode(rs.groupPubKey)
 
 	rs.round5NewKey = newKey
 

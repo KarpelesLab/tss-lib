@@ -77,6 +77,10 @@ func ImportKey(priv *big.Int, partyID *tss.PartyID) (*Key, error) {
 		Ks:             []*big.Int{new(big.Int).Set(shareID)},
 		BigXj:          []*crypto.ECPoint{pub},
 		GroupPublicKey: pub,
+		// ChainCode is deterministic from the joint pubkey, so the
+		// imported Key is ready for HD derivation without a separate
+		// AttachChainCode call.
+		ChainCode: DeriveChainCode(pub),
 	}
 	// Comprehensive sanity check using the freshly-added Key.ValidateBasic.
 	if err := key.ValidateBasic(); err != nil {
