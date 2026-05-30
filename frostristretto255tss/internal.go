@@ -14,6 +14,56 @@ import (
 	"github.com/KarpelesLab/tss-lib/v2/crypto/group"
 )
 
+// Domain-separation labels appended to the nonce_generate H3 input so the
+// hiding nonce d_i and the binding nonce e_i derive to distinct scalars even
+// when the RNG returns identical random bytes for both (faulty RNG, VM
+// snapshot+rollback). Without this, both nonces hash H3(random || Xi) over the
+// SAME Xi and would collapse to d_i == e_i under a repeating RNG — which leaks
+// the share. See FINDING 6 / RFC 9591 §4.1.
+const (
+	nonceHidingLabel  = "hiding"
+	nonceBindingLabel = "binding"
+)
+
+// nonceGenerateLabeled is RFC 9591 §4.1 nonce_generate with an extra
+// domain-separation label folded into the H3 input:
+//
+//	k = cs.H3(random_bytes || EncodeScalar(secret) || label)
+//
+// It mirrors frost.NonceGenerate (which omits the label) but distinguishes the
+// hiding and binding derivations. Keeping the label at this call site avoids a
+// signature change to crypto/frost.NonceGenerate; a follow-up could promote a
+// labeled variant into crypto/frost for reuse by frosttss.
+func nonceGenerateLabeled(cs frost.Ciphersuite, rng io.Reader, secret *big.Int, label string) (*big.Int, error) {
+	if cs == nil {
+		return nil, errors.New("frostristretto255tss: nonceGenerateLabeled requires a non-nil ciphersuite")
+	}
+	if secret == nil {
+		return nil, errors.New("frostristretto255tss: nonceGenerateLabeled requires a non-nil secret")
+	}
+	if rng == nil {
+		return nil, errors.New("frostristretto255tss: nonceGenerateLabeled requires a non-nil rng")
+	}
+	var k [32]byte
+	if _, err := io.ReadFull(rng, k[:]); err != nil {
+		return nil, fmt.Errorf("frostristretto255tss: nonceGenerateLabeled rand: %w", err)
+	}
+	enc := cs.Group().EncodeScalar(secret)
+	defer func() {
+		for i := range k {
+			k[i] = 0
+		}
+		for i := range enc {
+			enc[i] = 0
+		}
+	}()
+	buf := make([]byte, 0, len(k)+len(enc)+len(label))
+	buf = append(buf, k[:]...)
+	buf = append(buf, enc...)
+	buf = append(buf, label...)
+	return cs.H3(buf), nil
+}
+
 // vssCreate produces a Feldman secret sharing of `secret` over the given
 // group, returning the polynomial commitments (vs[c] = a_c*G) and the per-id
 // shares f(x_id). Equivalent to crypto/vss.Create but works over an arbitrary

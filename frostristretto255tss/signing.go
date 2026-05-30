@@ -65,9 +65,26 @@ func (s *Signing) round1() error {
 	Pi := s.params.PartyID()
 	i := Pi.Index
 	g := group.Ristretto255()
+	cs := frost.Ristretto255Ciphersuite()
 
-	s.di = g.RandomScalar(s.params.Rand())
-	s.ei = g.RandomScalar(s.params.Rand())
+	// RFC 9591 §4.1 nonce_generate: derive each nonce as
+	// H3(random_bytes || EncodeScalar(Xi)) rather than sampling the RNG
+	// directly. Mixing the secret share Xi into the hash defangs a
+	// faulty/repeated RNG: two NonceGenerate calls collide only if BOTH the
+	// random bytes AND the share collide. The two derivations are
+	// domain-separated below (binding label) so d_i != e_i even under
+	// identical RNG bytes — see frosttss/signing.go round1 for the matching
+	// Ed25519 rationale.
+	di, err := nonceGenerateLabeled(cs, s.params.Rand(), s.key.Xi, nonceHidingLabel)
+	if err != nil {
+		return fmt.Errorf("frostristretto255tss: nonce_generate d_i: %w", err)
+	}
+	ei, err := nonceGenerateLabeled(cs, s.params.Rand(), s.key.Xi, nonceBindingLabel)
+	if err != nil {
+		return fmt.Errorf("frostristretto255tss: nonce_generate e_i: %w", err)
+	}
+	s.di = di
+	s.ei = ei
 	s.Di = g.ScalarBaseMult(s.di)
 	s.Ei = g.ScalarBaseMult(s.ei)
 
