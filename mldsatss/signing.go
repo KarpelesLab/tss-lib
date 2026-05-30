@@ -51,6 +51,24 @@ func NewParameters(
 		return nil, fmt.Errorf("mldsatss: keyIds must have %d entries, got %d",
 			thParams.T, len(keyIds))
 	}
+	// Correctness requires keyIds[i] to be the Key44.Id of parties.IDs()[i],
+	// where parties.IDs() is the canonical (sorted) committee ordering. The
+	// committee slot used in signing is derived from this sorted order, so a
+	// misaligned keyIds slice would silently bind the wrong share/keyId to a
+	// party. We cannot recover each party's true Id from its PartyID here, but
+	// the canonical convention assigns ascending Ids to the ascending-sorted
+	// parties; enforce that keyIds is strictly increasing (and therefore
+	// distinct), matching the sorted parties.IDs() ordering.
+	ids := parties.IDs()
+	for i := 0; i < len(keyIds); i++ {
+		if i > 0 && keyIds[i] <= keyIds[i-1] {
+			return nil, fmt.Errorf(
+				"mldsatss: keyIds must be strictly increasing to match the sorted "+
+					"committee ordering; keyIds[%d]=%d is not greater than keyIds[%d]=%d",
+				i, keyIds[i], i-1, keyIds[i-1])
+		}
+		_ = ids[i] // length already checked equal to len(keyIds)
+	}
 	return &Parameters{
 		partyID:  partyID,
 		parties:  parties,
