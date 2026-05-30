@@ -90,6 +90,17 @@ func NewProof(Session []byte, N, P, Q *big.Int, rand io.Reader) (*ProofMod, erro
 		}
 	}
 
+	// For a non-Blum N (P or Q not ≡ 3 mod 4) one of the 4 (a, b) sign
+	// combinations may fail to be a QR mod both P and Q, leaving X[i]/Z[i] nil.
+	// Bytes() would then serialize them as empty, shipping a silently-dead
+	// proof. Reject such moduli explicitly so callers learn the key material is
+	// invalid.
+	for i := range Y {
+		if X[i] == nil || Z[i] == nil {
+			return nil, fmt.Errorf("modproof: NewProof: modulus is not a Blum integer (no QR found at index %d)", i)
+		}
+	}
+
 	pf := &ProofMod{W: W, X: X, A: A, B: B, Z: Z}
 	return pf, nil
 }
