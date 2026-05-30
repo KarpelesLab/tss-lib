@@ -44,7 +44,7 @@ func NewDLNProof(h1, h2, x, p, q, N *big.Int, rand io.Reader) *Proof {
 		alpha[i] = modN.Exp(h1, a[i])
 	}
 	msg := append([]*big.Int{h1, h2, N}, alpha[:]...)
-	c := common.SHA512_256i(msg...)
+	c := common.SHA512_256i_TAGGED([]byte("DLNProof"), msg...)
 	t := [Iterations]*big.Int{}
 	cIBI := new(big.Int)
 	for i := range t {
@@ -88,7 +88,7 @@ func (p *Proof) Verify(h1, h2, N *big.Int) bool {
 		}
 	}
 	msg := append([]*big.Int{h1, h2, N}, p.Alpha[:]...)
-	c := common.SHA512_256i(msg...)
+	c := common.SHA512_256i_TAGGED([]byte("DLNProof"), msg...)
 	cIBI := new(big.Int)
 	for i := 0; i < Iterations; i++ {
 		if p.Alpha[i] == nil || p.T[i] == nil {
