@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/paillier"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
@@ -102,5 +103,78 @@ func (key *Key) SubsetForParties(sortedIDs tss.SortedPartyIDs) (*Key, error) {
 		subset.BigXj[j] = key.BigXj[savedIdx]
 		subset.PaillierPKs[j] = key.PaillierPKs[savedIdx]
 	}
+	if err := subset.validateConsistency(); err != nil {
+		return nil, fmt.Errorf("SubsetForParties: %w", err)
+	}
 	return subset, nil
+}
+
+// validateConsistency re-verifies, on a Key loaded from (possibly untrusted)
+// serialized save data, that the per-party public shares BigXj are mutually
+// consistent with the stored ECDSAPub.
+//
+// It checks that:
+//   - ECDSAPub is non-nil and on-curve;
+//   - every BigXj[j] is non-nil and on-curve;
+//   - the Lagrange interpolation in the exponent of the BigXj over the
+//     participant Ks, evaluated at x=0, reconstructs ECDSAPub (i.e. f(0)·G).
+//
+// A single interpolation is performed. This guards the signing/resharing entry
+// paths against a tampered or corrupted key whose public shares no longer agree
+// with the group public key (which would otherwise surface only as a silently
+// invalid signature). The local-share check (Xi·G == BigXj[localIdx]) is done by
+// callers that know the local party index.
+func (key *Key) validateConsistency() error {
+	ec := tss.S256()
+	if key.ECDSAPub != nil {
+		ec = key.ECDSAPub.Curve()
+	}
+	if key.ECDSAPub == nil || !key.ECDSAPub.ValidateBasic() {
+		return fmt.Errorf("ECDSAPub is nil or not on curve")
+	}
+	n := len(key.Ks)
+	if n == 0 || len(key.BigXj) != n {
+		return fmt.Errorf("inconsistent key slice lengths (Ks=%d, BigXj=%d)", len(key.Ks), len(key.BigXj))
+	}
+	for j := 0; j < n; j++ {
+		if key.Ks[j] == nil {
+			return fmt.Errorf("Ks[%d] is nil", j)
+		}
+		if key.BigXj[j] == nil || !key.BigXj[j].ValidateBasic() {
+			return fmt.Errorf("BigXj[%d] is nil or not on curve", j)
+		}
+	}
+
+	// Lagrange interpolation in the exponent at x=0:
+	//   reconstructed = Σ_j λ_j · BigXj[j],  λ_j = Π_{c≠j} Ks[c]/(Ks[c]-Ks[j]).
+	modQ := common.ModInt(ec.Params().N)
+	var reconstructed *crypto.ECPoint
+	for j := 0; j < n; j++ {
+		lambda := big.NewInt(1)
+		for c := 0; c < n; c++ {
+			if c == j {
+				continue
+			}
+			if key.Ks[c].Cmp(key.Ks[j]) == 0 {
+				return fmt.Errorf("duplicate share id at indexes %d and %d", j, c)
+			}
+			num := key.Ks[c]
+			den := new(big.Int).Sub(key.Ks[c], key.Ks[j])
+			lambda = modQ.Mul(lambda, modQ.Mul(num, modQ.ModInverse(den)))
+		}
+		term := key.BigXj[j].ScalarMult(lambda)
+		if reconstructed == nil {
+			reconstructed = term
+		} else {
+			var err error
+			reconstructed, err = reconstructed.Add(term)
+			if err != nil {
+				return fmt.Errorf("interpolation failed: %w", err)
+			}
+		}
+	}
+	if reconstructed == nil || !reconstructed.Equals(key.ECDSAPub) {
+		return fmt.Errorf("BigXj do not interpolate to ECDSAPub")
+	}
+	return nil
 }

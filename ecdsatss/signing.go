@@ -93,6 +93,19 @@ func (key *Key) NewSigning(ctx context.Context, msg *big.Int, params *tss.Parame
 	if err != nil {
 		return nil, err
 	}
+	// Verify the local secret share matches the public share at this party's
+	// index: Xi·G == BigXj[localIdx]. SubsetForParties already verified that the
+	// BigXj interpolate to ECDSAPub; this ties our private Xi to that set.
+	localIdx := params.PartyID().Index
+	if localIdx < 0 || localIdx >= len(subsetKey.BigXj) {
+		return nil, fmt.Errorf("local party index %d out of range", localIdx)
+	}
+	if subsetKey.Xi == nil {
+		return nil, errors.New("local secret share Xi is nil")
+	}
+	if !crypto.ScalarBaseMult(params.EC(), subsetKey.Xi).Equals(subsetKey.BigXj[localIdx]) {
+		return nil, errors.New("local secret share Xi is inconsistent with BigXj[localIdx]")
+	}
 	partyCount := params.PartyCount()
 	s := &Signing{
 		ctx:           ctx,
