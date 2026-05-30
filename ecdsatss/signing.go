@@ -89,6 +89,18 @@ type Signing struct {
 // NTildej, H1j, H2j, BigXj, PaillierPKs) to match params.Parties().IDs() via
 // SubsetForParties, so callers can pass the full keygen key as-is.
 func (key *Key) NewSigning(ctx context.Context, msg *big.Int, params *tss.Parameters) (*Signing, error) {
+	// Validate the message scalar before doing any work. A nil msg would panic on
+	// first use; a negative msg passes the "< N" test but msg.Bytes() drops the
+	// sign, producing confusing aborts later. Require 0 < msg < N.
+	if msg == nil {
+		return nil, errors.New("message to sign is nil")
+	}
+	if msg.Sign() <= 0 {
+		return nil, errors.New("message to sign must be positive")
+	}
+	if msg.Cmp(params.EC().Params().N) >= 0 {
+		return nil, errors.New("message to sign is not less than the curve order")
+	}
 	subsetKey, err := key.SubsetForParties(params.Parties().IDs())
 	if err != nil {
 		return nil, err
@@ -256,8 +268,9 @@ func (s *Signing) round1() error {
 	i := Pi.Index
 	ec := s.params.EC()
 
-	// Validate message
-	if s.m.Cmp(ec.Params().N) >= 0 {
+	// Validate message: require 0 < m < N. nil/non-positive values are rejected
+	// in NewSigning, but re-check here as defense in depth before first use.
+	if s.m == nil || s.m.Sign() <= 0 || s.m.Cmp(ec.Params().N) >= 0 {
 		return errors.New("hashed message is not valid")
 	}
 
