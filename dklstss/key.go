@@ -112,6 +112,14 @@ func (k *Key) ValidateBasic() error {
 	if k.Xi == nil {
 		return errors.New("dklstss: Xi is nil")
 	}
+	// Range-check Xi to the canonical interval (0, q). Without this a
+	// non-canonical share such as Xi+q passes the algebraic Xi·G ==
+	// BigXj[Idx] check below (scalar mult reduces mod q) yet is not the
+	// representative produced by keygen. ImportKey already reduces D mod q;
+	// this mainly tightens Load and any direct in-memory construction.
+	if q := k.Curve.Params().N; k.Xi.Sign() <= 0 || k.Xi.Cmp(q) >= 0 {
+		return errors.New("dklstss: Xi out of range — must satisfy 0 < Xi < q")
+	}
 	if len(k.BigXj) != k.N {
 		return fmt.Errorf("dklstss: BigXj has %d entries, expected %d", len(k.BigXj), k.N)
 	}
