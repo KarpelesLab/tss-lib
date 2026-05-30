@@ -484,32 +484,77 @@ func (sp *CheckedSigningParty) round4(otherIds []*tss.PartyID, msgs []*checkedSi
 	sp.shat_i = crypto.CTScalarMulAddModN(ec, sp.rho_i, h, zeroBig)
 	sp.shat_i = crypto.CTScalarMulAddModN(ec, sp.r, sp.xRhoShare[sp.myPos], sp.shat_i)
 
-	for _, Pj := range sp.otherSubset {
-		r4 := &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()}
-		m := tss.JsonWrap(checkedSignTypeR4, r4, Pi, Pj)
-		if err := sp.params.Broker().Receive(m); err != nil {
-			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4→%s: %w", Pj, err))
-			return
-		}
+	// Broadcast (φ_i, ŝ_i) as a single To==nil message; the round-4 echo
+	// cross-check (round5Echo / finalize) then catches a party that
+	// reveals different (φ_i, ŝ_i) to different signers with identifiable
+	// abort. See signing_party.go round4 for the full rationale.
+	r4 := &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()}
+	bcast := tss.JsonWrap(checkedSignTypeR4, r4, Pi, nil)
+	if err := sp.params.Broker().Receive(bcast); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4 bcast: %w", err))
+		return
 	}
 
-	rcv := tss.NewJsonExpect[signR4](checkedSignTypeR4, sp.otherSubset, sp.finalize)
+	rcv := tss.NewJsonExpect[signR4](checkedSignTypeR4, sp.otherSubset, sp.round5Echo)
 	sp.params.Broker().Connect(checkedSignTypeR4, rcv)
 }
 
-func (sp *CheckedSigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
+// round5Echo stashes every peer's (φ_j, ŝ_j) and broadcasts a digest map
+// of them as an echo; finalize cross-checks the echoes. See
+// signing_party.go round5Echo for rationale.
+func (sp *CheckedSigningParty) round5Echo(otherIds []*tss.PartyID, msgs []*signR4) {
+	if err := sp.ctx.Err(); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
+	Pi := sp.params.PartyID()
+
+	digests := make(map[string][]byte, len(otherIds))
+	for n, pid := range otherIds {
+		sp.r4msgs[peerKeyStr(pid)] = msgs[n]
+		digests[peerKeyStr(pid)] = r4Digest(pid, msgs[n])
+	}
+	echoOut := &echoMsg{Digests: digests}
+	echoBcast := tss.JsonWrap(checkedSignTypeR4Echo, echoOut, Pi, nil)
+	if err := sp.params.Broker().Receive(echoBcast); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4echo bcast: %w", err))
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](checkedSignTypeR4Echo, sp.otherSubset,
+		func(ids []*tss.PartyID, ms []*echoMsg) {
+			sp.finalize(otherIds, ids, ms)
+		})
+	sp.params.Broker().Connect(checkedSignTypeR4Echo, rcv)
+}
+
+func (sp *CheckedSigningParty) finalize(otherIds, echoers []*tss.PartyID, echoes []*echoMsg) {
 	if err := sp.ctx.Err(); err != nil {
 		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	q := sp.params.EC().Params().N
+	Pi := sp.params.PartyID()
+
+	// Round-4 echo cross-check: a party that equivocated on its
+	// (φ_i, ŝ_i) reveal is named in Culprits().
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	for _, pid := range otherIds {
+		myDigests[peerKeyStr(pid)] = r4Digest(pid, sp.r4msgs[peerKeyStr(pid)])
+	}
+	selfKey := peerKeyStr(Pi)
+	myDigests[selfKey] = r4Digest(Pi, &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()})
+	all := append([]*tss.PartyID{Pi}, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, echoers, echoes, all, echoSourceCheckedSign); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
 
 	phi := new(big.Int).Set(sp.phi_i)
 	shat := new(big.Int).Set(sp.shat_i)
-	for n, pid := range otherIds {
-		_ = pid
-		pj := new(big.Int).SetBytes(msgs[n].Phi)
-		sj := new(big.Int).SetBytes(msgs[n].Shat)
+	for _, pid := range otherIds {
+		m := sp.r4msgs[peerKeyStr(pid)]
+		pj := new(big.Int).SetBytes(m.Phi)
+		sj := new(big.Int).SetBytes(m.Shat)
 		phi = addMod(q, phi, pj)
 		shat = addMod(q, shat, sj)
 	}
@@ -579,6 +624,7 @@ const (
 	checkedSignTypeR2     = "dkls:csign:r2"
 	checkedSignTypeR3     = "dkls:csign:r3"
 	checkedSignTypeR4     = "dkls:csign:r4"
+	checkedSignTypeR4Echo = "dkls:csign:r4echo"
 
 	echoSourceCheckedSign = "dklstss-csign"
 )

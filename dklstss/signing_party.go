@@ -511,32 +511,90 @@ func (sp *SigningParty) round4(otherIds []*tss.PartyID, msgs []*signR3) {
 	t1 := crypto.CTScalarMulAddModN(ec, sp.rho_i, hashI, zero)
 	sp.shat_i = crypto.CTScalarMulAddModN(ec, sp.r, sp.xRhoShare[sp.myPos], t1)
 
+	// Broadcast (φ_i, ŝ_i) as a single To==nil message rather than N-1
+	// per-recipient unicasts. The bytes are identical for every recipient
+	// by construction (this is THIS party's single partial-signature
+	// contribution), so a broadcast lets a well-behaved broker enforce the
+	// "same bytes to every recipient" contract — and the round-4 echo
+	// cross-check below (round4Echo) catches a malicious broker (or party)
+	// that ships different (φ_i, ŝ_i) to different signers, naming the
+	// equivocator in Culprits() rather than failing as an opaque
+	// verify-gate error. Mirrors the round-1 K_i echo (round2KCollect /
+	// round2Echo).
 	r4 := &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()}
-	for _, Pj := range sp.otherSubset {
-		m := tss.JsonWrap(signTypeR4, r4, Pi, Pj)
-		if err := sp.params.Broker().Receive(m); err != nil {
-			sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4→%s: %w", Pj, err))
-			return
-		}
+	bcast := tss.JsonWrap(signTypeR4, r4, Pi, nil)
+	if err := sp.params.Broker().Receive(bcast); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4 bcast: %w", err))
+		return
 	}
-	rcv := tss.NewJsonExpect[signR4](signTypeR4, sp.otherSubset, sp.finalize)
+	rcv := tss.NewJsonExpect[signR4](signTypeR4, sp.otherSubset, sp.round5Echo)
 	sp.params.Broker().Connect(signTypeR4, rcv)
 }
 
-func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
+// round5Echo fires after every other signer's (φ_j, ŝ_j) broadcast has
+// arrived. It stashes the received contributions, then broadcasts a
+// digest map of every peer's (φ_j, ŝ_j) as an echo. The echo-cross-check
+// round (finalize below) catches a party that revealed different
+// (φ_i, ŝ_i) to different signers with identifiable abort.
+func (sp *SigningParty) round5Echo(otherIds []*tss.PartyID, msgs []*signR4) {
+	if err := sp.ctx.Err(); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
+	Pi := sp.params.PartyID()
+
+	// Stash every peer's contribution keyed by party so finalize can sum
+	// the canonical bytes this party actually received.
+	digests := make(map[string][]byte, len(otherIds))
+	for n, pid := range otherIds {
+		sp.r4msgs[peerKeyStr(pid)] = msgs[n]
+		digests[peerKeyStr(pid)] = r4Digest(pid, msgs[n])
+	}
+	echoOut := &echoMsg{Digests: digests}
+	echoBcast := tss.JsonWrap(signTypeR4Echo, echoOut, Pi, nil)
+	if err := sp.params.Broker().Receive(echoBcast); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, fmt.Errorf("broker r4echo bcast: %w", err))
+		return
+	}
+	rcv := tss.NewJsonExpect[echoMsg](signTypeR4Echo, sp.otherSubset,
+		func(ids []*tss.PartyID, ms []*echoMsg) {
+			sp.finalize(otherIds, ids, ms)
+		})
+	sp.params.Broker().Connect(signTypeR4Echo, rcv)
+}
+
+func (sp *SigningParty) finalize(otherIds, echoers []*tss.PartyID, echoes []*echoMsg) {
 	if err := sp.ctx.Err(); err != nil {
 		sendOnce(&sp.errOnce, sp.Err, err)
 		return
 	}
 	q := sp.params.EC().Params().N
+	Pi := sp.params.PartyID()
+
+	// Cross-check every signer's round-4 reveal: a party that sent
+	// different (φ_i, ŝ_i) to different peers is detected when the echoed
+	// digests disagree, and named as the culprit. My local view:
+	//   - for each peer dealer pid: digest of the (φ, ŝ) I received from pid.
+	//   - for self: digest of my own (φ_i, ŝ_i).
+	myDigests := make(map[string][]byte, len(otherIds)+1)
+	for _, pid := range otherIds {
+		myDigests[peerKeyStr(pid)] = r4Digest(pid, sp.r4msgs[peerKeyStr(pid)])
+	}
+	selfKey := peerKeyStr(Pi)
+	myDigests[selfKey] = r4Digest(Pi, &signR4{Phi: sp.phi_i.Bytes(), Shat: sp.shat_i.Bytes()})
+	all := append([]*tss.PartyID{Pi}, otherIds...)
+	if err := verifyEchoes(myDigests, selfKey, echoers, echoes, all, echoSourceSign); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
 
 	phi := new(big.Int).Set(sp.phi_i)
 	shat := new(big.Int).Set(sp.shat_i)
-	for n, pid := range otherIds {
-		_ = pid
-		phi.Add(phi, new(big.Int).SetBytes(msgs[n].Phi))
+	for _, pid := range otherIds {
+		m := sp.r4msgs[peerKeyStr(pid)]
+		phi.Add(phi, new(big.Int).SetBytes(m.Phi))
 		phi.Mod(phi, q)
-		shat.Add(shat, new(big.Int).SetBytes(msgs[n].Shat))
+		shat.Add(shat, new(big.Int).SetBytes(m.Shat))
 		shat.Mod(shat, q)
 	}
 	if phi.Sign() == 0 {
@@ -691,10 +749,22 @@ const (
 	signTypeR2     = "dkls:sign:r2"
 	signTypeR3     = "dkls:sign:r3"
 	signTypeR4     = "dkls:sign:r4"
+	signTypeR4Echo = "dkls:sign:r4echo" // echo-broadcast phase for (φ_i, ŝ_i) equivocation defense
 
 	echoTagSign    = "DKLS23-echo-sign-v1"
+	echoTagSignR4  = "DKLS23-echo-sign-r4-v1"
 	echoSourceSign = "dklstss-sign"
 )
+
+// r4Digest computes the echo-broadcast digest for one party's round-4
+// (φ, ŝ) partial-signature reveal. Reuses commitDigest with a distinct
+// round-4 sign-phase tag so a digest from this phase can never collide
+// with a round-1 K_i digest. Phi and Shat are length-prefixed inside
+// commitDigest, so swapping the two fields or an unusual byte length
+// would not produce the same digest.
+func r4Digest(dealer *tss.PartyID, r4 *signR4) []byte {
+	return commitDigest(echoTagSignR4, dealer, [][]byte{r4.Phi, r4.Shat})
+}
 
 // kIDigest computes the echo-broadcast digest for one party's K_i =
 // k_i*G commitment. Reuses commitDigest with the sign-phase tag.
