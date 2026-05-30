@@ -55,6 +55,12 @@ func SHA512_256(in ...[]byte) []byte {
 }
 
 // SHA512_256i computes the SHA-512/256 hash of the given big.Int values and returns the result as a big.Int.
+//
+// Each operand is sign-bound: a single sign byte (0x00 for sign >= 0, 0x01 for
+// negative) is hashed alongside the operand's magnitude bytes so that +x and -x
+// produce different digests (big.Int.Bytes() is magnitude-only). A nil operand is
+// treated as zero (sign byte 0x00, empty magnitude). The existing length-prefix,
+// delimiter and block-count framing for domain separation are preserved.
 func SHA512_256i(in ...*big.Int) *big.Int {
 	var data []byte
 	state := sha512.New512_256()
@@ -69,18 +75,26 @@ func SHA512_256i(in ...*big.Int) *big.Int {
 	// this prefix is never read/interpreted, so that doesn't matter.
 	binary.LittleEndian.PutUint64(inLenBz, uint64(inLen))
 	ptrs := make([][]byte, inLen)
+	signs := make([]byte, inLen)
 	for i, n := range in {
 		if n == nil {
 			ptrs[i] = zero.Bytes()
+			signs[i] = 0x00
 		} else {
 			ptrs[i] = n.Bytes()
+			if n.Sign() < 0 {
+				signs[i] = 0x01
+			} else {
+				signs[i] = 0x00
+			}
 		}
 		bzSize += len(ptrs[i])
 	}
-	dataCap := len(inLenBz) + bzSize + inLen + (inLen * 8)
+	dataCap := len(inLenBz) + bzSize + inLen + (inLen * 8) + inLen
 	data = make([]byte, 0, dataCap)
 	data = append(data, inLenBz...)
 	for i := range in {
+		data = append(data, signs[i]) // sign byte binds the operand's sign
 		data = append(data, ptrs[i]...)
 		data = append(data, hashInputDelimiter) // safety delimiter
 		dataLen := make([]byte, 8)              // 64-bits
@@ -97,7 +111,12 @@ func SHA512_256i(in ...*big.Int) *big.Int {
 	return new(big.Int).SetBytes(state.Sum(nil))
 }
 
-// SHA512_256i_TAGGED tagged version of SHA512_256i
+// SHA512_256i_TAGGED tagged version of SHA512_256i.
+//
+// Like SHA512_256i, each operand is sign-bound: a single sign byte (0x00 for
+// sign >= 0, 0x01 for negative) is hashed alongside the operand's magnitude bytes
+// so that +x and -x produce different digests. A nil operand is treated as zero
+// (sign byte 0x00, empty magnitude). The tag and existing framing are preserved.
 func SHA512_256i_TAGGED(tag []byte, in ...*big.Int) *big.Int {
 	tagBz := SHA512_256(tag)
 	var data []byte
@@ -115,18 +134,26 @@ func SHA512_256i_TAGGED(tag []byte, in ...*big.Int) *big.Int {
 	// this prefix is never read/interpreted, so that doesn't matter.
 	binary.LittleEndian.PutUint64(inLenBz, uint64(inLen))
 	ptrs := make([][]byte, inLen)
+	signs := make([]byte, inLen)
 	for i, n := range in {
 		if n == nil {
 			ptrs[i] = zero.Bytes()
+			signs[i] = 0x00
 		} else {
 			ptrs[i] = n.Bytes()
+			if n.Sign() < 0 {
+				signs[i] = 0x01
+			} else {
+				signs[i] = 0x00
+			}
 		}
 		bzSize += len(ptrs[i])
 	}
-	dataCap := len(inLenBz) + bzSize + inLen + (inLen * 8)
+	dataCap := len(inLenBz) + bzSize + inLen + (inLen * 8) + inLen
 	data = make([]byte, 0, dataCap)
 	data = append(data, inLenBz...)
 	for i := range in {
+		data = append(data, signs[i]) // sign byte binds the operand's sign
 		data = append(data, ptrs[i]...)
 		data = append(data, hashInputDelimiter) // safety delimiter
 		dataLen := make([]byte, 8)              // 64-bits
@@ -144,13 +171,22 @@ func SHA512_256i_TAGGED(tag []byte, in ...*big.Int) *big.Int {
 }
 
 // SHA512_256iOne computes the SHA-512/256 hash of a single big.Int and returns the result as a big.Int.
+//
+// The operand is sign-bound: a single sign byte (0x00 for sign >= 0, 0x01 for
+// negative) is prepended to the operand's magnitude bytes so that +x and -x
+// produce different digests (big.Int.Bytes() is magnitude-only).
 func SHA512_256iOne(in *big.Int) *big.Int {
 	var data []byte
 	state := sha512.New512_256()
 	if in == nil {
 		return nil
 	}
-	data = in.Bytes()
+	if in.Sign() < 0 {
+		data = append(data, 0x01) // sign byte binds the operand's sign
+	} else {
+		data = append(data, 0x00)
+	}
+	data = append(data, in.Bytes()...)
 	// n < len(data) or an error will never happen.
 	// see: https://golang.org/pkg/hash/#Hash and https://github.com/golang/go/wiki/Hashing#the-hashhash-interface
 	if _, err := state.Write(data); err != nil {
