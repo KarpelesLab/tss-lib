@@ -8,7 +8,9 @@ package signing
 
 import (
 	"errors"
+	"fmt"
 
+	"github.com/KarpelesLab/tss-lib/v2/crypto"
 	"github.com/KarpelesLab/tss-lib/v2/crypto/commitments"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
@@ -37,6 +39,14 @@ func (round *round9) Start() error {
 			return round.WrapError(errors.New("de-commitment for bigVj and bigAj failed"), Pj)
 		}
 		UjX, UjY, TjX, TjY := values[0], values[1], values[2], values[3]
+		// defense-in-depth: ensure the decommitted Uj/Tj are valid in-field,
+		// on-curve points before aggregating (consistent with rounds 5/7).
+		if _, err := crypto.NewECPoint(round.Params().EC(), UjX, UjY); err != nil {
+			return round.WrapError(fmt.Errorf("NewECPoint(Uj): %w", err), Pj)
+		}
+		if _, err := crypto.NewECPoint(round.Params().EC(), TjX, TjY); err != nil {
+			return round.WrapError(fmt.Errorf("NewECPoint(Tj): %w", err), Pj)
+		}
 		UX, UY = round.Params().EC().Add(UX, UY, UjX, UjY)
 		TX, TY = round.Params().EC().Add(TX, TY, TjX, TjY)
 	}
