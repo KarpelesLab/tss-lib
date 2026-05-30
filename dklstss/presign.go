@@ -108,6 +108,11 @@ func Presign(keys []*Key, signerIdx []int, rng io.Reader) (*PresignOutput, error
 			return nil, fmt.Errorf("dklstss: Presign key %d inconsistent", idx)
 		}
 	}
+	// Canonicalize subset order — see signing.go. SignWithPresign spreads
+	// any HD tweak across all parties' shares, so ordering does not affect
+	// its tweak placement, but keeping the Lagrange/subset ordering
+	// canonical matches the broker convention.
+	sortSignersByID(signers)
 
 	ids := make([]*big.Int, sgn)
 	for i, k := range signers {
@@ -435,7 +440,13 @@ func SignWithPresignDurable(presign *PresignOutput, hash []byte, tweak *big.Int,
 // in the caller's persistent store, refuse to invoke SignWithPresign.
 func (p *PresignOutput) RHash() []byte {
 	h := common.SHA512_256i_TAGGED([]byte("DKLS23-presign-rhash-v1"), p.R.X(), p.R.Y())
-	return h.Bytes()
+	// Always emit a fixed 32-byte big-endian value. big.Int.Bytes() strips
+	// leading zero bytes, so a digest whose top byte is 0x00 (~1/256) would
+	// otherwise return 31 bytes — a variable-length key into the caller's
+	// durable consumed-presigns store. Left-pad to the documented width.
+	out := make([]byte, 32)
+	h.FillBytes(out)
+	return out
 }
 
 // Consumed reports whether the presign has been consumed.
