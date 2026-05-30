@@ -5,7 +5,26 @@ import (
 	"errors"
 
 	"github.com/KarpelesLab/mldsa"
+	"github.com/KarpelesLab/tss-lib/v2/common"
 )
+
+// zeroizeRing wipes a slice of plain-domain ring elements (best-effort).
+func zeroizeRing(v []mldsa.RingElement) {
+	for i := range v {
+		for j := range v[i] {
+			v[i][j] = 0
+		}
+	}
+}
+
+// zeroizeNtt wipes a slice of NTT-domain ring elements (best-effort).
+func zeroizeNtt(v []mldsa.NttElement) {
+	for i := range v {
+		for j := range v[i] {
+			v[i][j] = 0
+		}
+	}
+}
 
 // TrustedDealerKeygen44 derives a threshold ML-DSA-44 public key and N
 // per-party private-key shares from a 32-byte seed. It mirrors
@@ -100,6 +119,14 @@ func TrustedDealerKeygen44(seed [32]byte, params *ThresholdParams44) (*PublicKey
 			}
 		}
 
+		// Wipe the dealer's local secret copies of this share's seed and
+		// polynomials. share.S1/share.S2 are independent value copies that
+		// remain in the distributed shares; only these dealer-side locals are
+		// erased. Best-effort.
+		common.ZeroizeBytes(sSeed[:])
+		zeroizeRing(s1[:])
+		zeroizeRing(s2[:])
+
 		// Gosper's hack: next mask with same popcount.
 		c := mask & -mask
 		r := mask + c
@@ -119,6 +146,11 @@ func TrustedDealerKeygen44(seed [32]byte, params *ThresholdParams44) (*PublicKey
 			t1[i][j] = hi
 		}
 	}
+
+	// The dealer no longer needs the aggregate secret accumulators; wipe them
+	// (the per-party shares carry the secret going forward). Best-effort.
+	zeroizeNtt(s1hTotal[:])
+	zeroizeRing(s2Total[:])
 
 	// Pack the public key into its canonical FIPS 204 form.
 	pkBytes := make([]byte, 32+mldsa.K44*mldsa.EncodingSize10)

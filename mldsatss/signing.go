@@ -10,8 +10,35 @@ import (
 	"sync/atomic"
 
 	"github.com/KarpelesLab/mldsa"
+	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
 )
+
+// zeroizeFVec44 best-effort wipes a hyperball sample (secret nonce y) by
+// overwriting every float64 lane with zero. Like common.ZeroizeBytes, this is
+// best-effort: Go's GC may already have copied the value elsewhere.
+func zeroizeFVec44(fv *mldsa.FVec44) {
+	for i := range fv {
+		fv[i] = 0
+	}
+}
+
+// zeroizeNttVecL44 / zeroizeNttVecK44 wipe recovered secret NTT vectors.
+func zeroizeNttVecL44(v *[mldsa.L44]mldsa.NttElement) {
+	for i := range v {
+		for j := range v[i] {
+			v[i][j] = 0
+		}
+	}
+}
+
+func zeroizeNttVecK44(v *[mldsa.K44]mldsa.NttElement) {
+	for i := range v {
+		for j := range v[i] {
+			v[i][j] = 0
+		}
+	}
+}
 
 // ErrAllTriesRejected is returned when every one of the K parallel tries in a
 // single 3-round signing exchange is rejected (by party-side bound or
@@ -200,11 +227,14 @@ func (s *Signing44) round1() error {
 	params := s.params.thParams
 	kTries := int(params.K)
 
-	// Fresh rhop from the party's RNG.
+	// Fresh rhop from the party's RNG. It seeds every hyperball sample for
+	// this attempt, so wipe it as soon as round1 returns (the per-try secret
+	// nonces y derived from it live on in s.stws until round3).
 	var rhop [64]byte
 	if _, err := io.ReadFull(s.params.rand, rhop[:]); err != nil {
 		return fmt.Errorf("mldsatss: rhop read failed: %w", err)
 	}
+	defer common.ZeroizeBytes(rhop[:])
 
 	// Cached matrix A (NTT form, row-major K44×L44).
 	A := s.key.Matrix()
@@ -403,6 +433,15 @@ func (s *Signing44) round3() {
 		s.fail(err)
 		return
 	}
+	// Wipe the recovered secret-key material and the per-try secret nonces
+	// (s.stws holds y) once this round is done with them. Best-effort.
+	defer func() {
+		zeroizeNttVecL44(&s1h)
+		zeroizeNttVecK44(&s2h)
+		for i := range s.stws {
+			zeroizeFVec44(&s.stws[i])
+		}
+	}()
 
 	// For each try, compute our contribution to z.
 	resps := make([][mldsa.L44]mldsa.RingElement, params.K)

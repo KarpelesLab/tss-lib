@@ -93,6 +93,41 @@ func (k *Key44) Validate() error {
 	return nil
 }
 
+// Destroy best-effort wipes every secret share held by this key (both the
+// plain and NTT-domain s1/s2 polynomials) and clears the share map. The
+// public fields (Rho, Tr, T1, A) are left intact. Like the package's other
+// zeroization, this is best-effort: Go's GC may already have copied the
+// secret elsewhere. After Destroy, the key can no longer participate in
+// signing (Validate will fail with "key has no shares").
+func (k *Key44) Destroy() {
+	for _, sh := range k.Shares {
+		if sh == nil {
+			continue
+		}
+		for i := range sh.S1 {
+			for j := range sh.S1[i] {
+				sh.S1[i][j] = 0
+			}
+		}
+		for i := range sh.S2 {
+			for j := range sh.S2[i] {
+				sh.S2[i][j] = 0
+			}
+		}
+		for i := range sh.S1h {
+			for j := range sh.S1h[i] {
+				sh.S1h[i][j] = 0
+			}
+		}
+		for i := range sh.S2h {
+			for j := range sh.S2h[i] {
+				sh.S2h[i][j] = 0
+			}
+		}
+	}
+	k.Shares = nil
+}
+
 // recoverShare reconstructs this party's contribution (s1, s2 in NTT form) to
 // the aggregated secret for the signing set described by act. It follows the
 // sharing-pattern reconstruction used in the reference implementation.
