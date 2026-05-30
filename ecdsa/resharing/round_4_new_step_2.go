@@ -61,6 +61,14 @@ func (round *round4) Start() error {
 			r2msg1.UnmarshalNTilde(),
 			r2msg1.UnmarshalH1(),
 			r2msg1.UnmarshalH2()
+		// mirror keygen round 2: reject moduli that are not exactly the
+		// required bit length before launching any proof goroutines.
+		if paiPK.N.BitLen() != keygen.PaillierBitsLen {
+			return round.WrapError(errors.New("got paillier modulus with insufficient bits for this party"), msg.GetFrom())
+		}
+		if NTildej.BitLen() != keygen.PaillierBitsLen {
+			return round.WrapError(errors.New("got NTildej with insufficient bits for this party"), msg.GetFrom())
+		}
 		if H1j.Cmp(H2j) == 0 {
 			return round.WrapError(errors.New("h1j and h2j were equal for this party"), msg.GetFrom())
 		}

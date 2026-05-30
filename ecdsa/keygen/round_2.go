@@ -20,7 +20,12 @@ import (
 )
 
 const (
-	paillierBitsLen = 2048
+	// PaillierBitsLen is the required exact bit length of a party's Paillier
+	// modulus N and of NTilde. Shared with the resharing protocol so the new
+	// committee validates moduli the same way keygen does.
+	PaillierBitsLen = 2048
+
+	paillierBitsLen = PaillierBitsLen
 )
 
 func (round *round2) Start() error {
