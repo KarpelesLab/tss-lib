@@ -22,6 +22,11 @@ type signRound2msg44 struct {
 }
 
 // signRound3msg44 is the per-party response — packed z_i for i ∈ [0, K).
+//
+// The z polynomials are packed with mldsa.PackZ17 / unpacked with
+// mldsa.UnpackZ17, which use mldsa.EncodingSize18 (an 18-bit-per-coefficient
+// encoding for γ₁ = 2^17). Despite the "Z17" in the helper names, the
+// on-wire size per coefficient is 18 bits, hence EncodingSize18.
 type signRound3msg44 struct {
 	Resp []byte `json:"resp"` // ThParams.K × L44 × mldsa.EncodingSize18 bytes
 }
