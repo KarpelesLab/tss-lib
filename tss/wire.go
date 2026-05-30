@@ -15,6 +15,13 @@ import (
 
 // Used externally to update a LocalParty with a valid ParsedMessage
 func ParseWireMessage(wireBytes []byte, from *PartyID, isBroadcast bool) (ParsedMessage, error) {
+	// Guard against a nil or unresolved sender. `from` is supplied by the
+	// transport/host and may be nil if the frame's sender could not be
+	// resolved; dereferencing it here (or downstream) would crash the node,
+	// allowing a malicious or buggy relay to trigger a nil-deref DoS.
+	if from == nil || from.MessageWrapper_PartyID == nil {
+		return nil, errors.New("ParseWireMessage: nil or unresolved sender PartyID")
+	}
 	wire := new(MessageWrapper)
 	wire.Message = new(anypb.Any)
 	wire.From = from.MessageWrapper_PartyID
