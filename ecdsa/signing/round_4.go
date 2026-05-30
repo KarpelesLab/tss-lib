@@ -40,6 +40,12 @@ func (round *round4) Start() error {
 
 	// compute the multiplicative inverse of theta mod q
 	thetaInverse = modN.ModInverse(thetaInverse)
+	if thetaInverse == nil {
+		// a malicious coalition can drive the aggregate theta to 0 mod q, in
+		// which case it has no inverse; abort cleanly instead of panicking
+		// later when R is scaled by a nil thetaInverse.
+		return round.WrapError(errors.New("theta is not invertible mod q"), round.PartyID())
+	}
 	i := round.PartyID().Index
 	ContextI := append(round.temp.ssid, new(big.Int).SetUint64(uint64(i)).Bytes()...)
 	piGamma, err := schnorr.NewZKProof(ContextI, round.temp.gamma, round.temp.pointGamma, round.Rand())

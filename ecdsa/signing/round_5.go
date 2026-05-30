@@ -58,6 +58,12 @@ func (round *round5) Start() error {
 	}
 
 	R = R.ScalarMult(round.temp.thetaInverse)
+	// a malicious coalition can drive the reconstructed R to the identity
+	// (point at infinity) or an otherwise invalid point; abort cleanly rather
+	// than panic in R.X()/R.Y() below.
+	if R == nil || !R.IsOnCurve() || R.IsIdentity() {
+		return round.WrapError(errors.New("reconstructed R is not a valid curve point"), round.PartyID())
+	}
 	N := round.Params().EC().Params().N
 	modN := common.ModInt(N)
 	rx := R.X()
