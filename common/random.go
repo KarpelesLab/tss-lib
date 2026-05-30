@@ -15,6 +15,13 @@ import (
 
 const (
 	mustGetRandomIntMaxBits = 5000
+
+	// randomSamplingMaxIters bounds the rejection-sampling loops below so that
+	// an exhausted/dead io.Reader, or a pathological modulus, cannot wedge a
+	// node in an unbounded loop (a DoS vector). For valid inputs and a healthy
+	// reader these loops terminate in O(1) expected iterations, so this bound
+	// is never reached in practice — it only converts a hang into a fail-fast.
+	randomSamplingMaxIters = 100
 )
 
 // MustGetRandomInt panics if it is unable to gather entropy from `io.Reader` or when `bits` is <= 0
@@ -43,6 +50,10 @@ func MustGetRandomInt(rand io.Reader, bits int) *big.Int {
 // on 0 is 1/lessThan ≈ 2^{-256} for curve-order moduli, so existing
 // callers are unaffected in practice; the rejection closes a latent
 // foot-gun without a meaningful performance cost.
+//
+// It returns nil when no value can be produced: when lessThan is nil,
+// non-positive, or <= 1 (the interval [1, lessThan) is then empty).
+// Callers MUST check for a nil result before use.
 func GetRandomPositiveInt(rand io.Reader, lessThan *big.Int) *big.Int {
 	if lessThan == nil || zero.Cmp(lessThan) != -1 {
 		return nil
@@ -90,13 +101,16 @@ func GetRandomPositiveRelativelyPrimeInt(rand io.Reader, n *big.Int) *big.Int {
 		return nil
 	}
 	var try *big.Int
-	for {
+	for i := 0; i < randomSamplingMaxIters; i++ {
 		try = MustGetRandomInt(rand, n.BitLen())
 		if IsNumberInMultiplicativeGroup(n, try) {
-			break
+			return try
 		}
 	}
-	return try
+	// Give up rather than loop forever on a pathological modulus or an
+	// exhausted reader; returning nil follows the existing convention used
+	// for invalid inputs above.
+	return nil
 }
 
 // IsNumberInMultiplicativeGroup returns true if v is in the multiplicative group of integers modulo n.
@@ -120,13 +134,20 @@ func GetRandomGeneratorOfTheQuadraticResidue(rand io.Reader, n *big.Int) *big.In
 }
 
 // GetRandomQuadraticNonResidue returns a quadratic non residue of odd n.
+// It returns nil if no non-residue is found within a bounded number of
+// attempts (e.g. an exhausted reader or a pathological n), rather than
+// looping forever.
 func GetRandomQuadraticNonResidue(rand io.Reader, n *big.Int) *big.Int {
-	for {
+	for i := 0; i < randomSamplingMaxIters; i++ {
 		w := GetRandomPositiveInt(rand, n)
+		if w == nil {
+			return nil
+		}
 		if big.Jacobi(w, n) == -1 {
 			return w
 		}
 	}
+	return nil
 }
 
 // GetRandomBytes returns random bytes of length.
