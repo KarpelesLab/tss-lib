@@ -33,7 +33,8 @@ func (round *round5) Start() error {
 		ContextI := append(round.temp.ssid, big.NewInt(int64(i)).Bytes()...)
 		round.save.BigXj = round.temp.newBigXjs
 		round.save.ShareID = round.PartyID().KeyInt()
-		round.save.Xi = round.temp.newXi
+		// store Xi reduced mod the curve order, matching keygen round 3.
+		round.save.Xi = new(big.Int).Mod(round.temp.newXi, round.Params().EC().Params().N)
 		round.save.Ks = round.temp.newKs
 
 		// misc: build list of paillier public keys to save
