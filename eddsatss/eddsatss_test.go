@@ -580,3 +580,89 @@ func TestResharing(t *testing.T) {
 	assert.Len(t, sigs[0].Signature, 64, "signature should be 64 bytes")
 	t.Logf("Resharing + Signing complete. Signature: %x", sigs[0].Signature)
 }
+
+// TestSignLeadingZeroMessage verifies that a 32-byte message whose first byte
+// is 0x00 is signed over its full 32-byte length when fullBytesLen is supplied.
+// Without the fullBytesLen handling, big.Int.Bytes() would strip the leading
+// zero byte, producing a signature over a 31-byte string that an external
+// Ed25519 verifier handed the original 32-byte message would reject, and that
+// would collide with the 31-byte message lacking the leading zero.
+func TestSignLeadingZeroMessage(t *testing.T) {
+	const (
+		partyCount = 3
+		threshold  = 1
+	)
+
+	// --- Keygen ---
+	pIDs := tss.GenerateTestPartyIDs(partyCount)
+	hub := newTestHub(partyCount)
+	p2pCtx := tss.NewPeerContext(pIDs)
+
+	keygens := make([]*Keygen, partyCount)
+	for i := 0; i < partyCount; i++ {
+		params := tss.NewParameters(tss.Edwards(), p2pCtx, pIDs[i], partyCount, threshold)
+		params.SetBroker(hub.brokers[i])
+		kg, err := NewKeygen(context.Background(), params)
+		require.NoError(t, err)
+		keygens[i] = kg
+	}
+
+	keys := make([]*Key, partyCount)
+	for i := 0; i < partyCount; i++ {
+		select {
+		case k := <-keygens[i].Done:
+			keys[i] = k
+		case err := <-keygens[i].Err:
+			t.Fatalf("Keygen error for party %d: %v", i, err)
+		case <-time.After(5 * time.Minute):
+			t.Fatalf("Keygen timed out for party %d", i)
+		}
+	}
+
+	// --- Build a 32-byte message whose first byte is 0x00 ---
+	msgBytes := make([]byte, 32)
+	for i := 1; i < 32; i++ {
+		msgBytes[i] = byte(i + 1)
+	}
+	// msgBytes[0] stays 0x00 so big.Int.Bytes() would strip it.
+	msg := new(big.Int).SetBytes(msgBytes)
+	require.Len(t, msg.Bytes(), 31, "sanity: big.Int.Bytes() must strip the leading zero")
+
+	// --- Signing with fullBytesLen = 32 ---
+	signHub := newTestHub(partyCount)
+	signings := make([]*Signing, partyCount)
+	for i := 0; i < partyCount; i++ {
+		params := tss.NewParameters(tss.Edwards(), p2pCtx, pIDs[i], partyCount, threshold)
+		params.SetBroker(signHub.brokers[i])
+		sg, err := keys[i].NewSigning(context.Background(), msg, params, 32)
+		require.NoError(t, err, "NewSigning should not fail for party %d", i)
+		signings[i] = sg
+	}
+
+	sigs := make([]*SignatureData, partyCount)
+	for i := 0; i < partyCount; i++ {
+		select {
+		case sig := <-signings[i].Done:
+			sigs[i] = sig
+		case err := <-signings[i].Err:
+			t.Fatalf("Party %d signing error: %v", i, err)
+		case <-time.After(5 * time.Minute):
+			t.Fatalf("Party %d signing timed out", i)
+		}
+	}
+
+	// SignatureData.M must be the full 32-byte message, leading zero preserved.
+	assert.Len(t, sigs[0].M, 32, "SignatureData.M must be 32 bytes")
+	assert.Equal(t, msgBytes, sigs[0].M, "SignatureData.M must equal the original 32-byte message")
+
+	// External edwards25519 verification with the ORIGINAL 32-byte message.
+	pk := edwards25519.PublicKey{
+		Curve: tss.Edwards(),
+		X:     keys[0].EDDSAPub.X(),
+		Y:     keys[0].EDDSAPub.Y(),
+	}
+	parsed, err := edwards25519.ParseSignature(sigs[0].Signature)
+	require.NoError(t, err, "signature should parse")
+	ok := edwards25519.VerifyRS(&pk, msgBytes, parsed.R, parsed.S)
+	assert.True(t, ok, "signature must verify under the full 32-byte message")
+}

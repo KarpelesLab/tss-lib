@@ -22,7 +22,15 @@ type Signing struct {
 	params    *tss.Parameters
 	key       *Key
 	msg       *big.Int
-	wi        *big.Int
+	// fullBytesLen is the intended byte length of the message. big.Int.Bytes()
+	// strips leading zero bytes, so a 32-byte hash beginning with 0x00 would be
+	// hashed/emitted as a shorter string — breaking external Ed25519 verifiers
+	// and letting messages that differ only in leading zeros collide. When
+	// fullBytesLen > 0 the message is left-padded to exactly that many bytes via
+	// FillBytes for both the challenge hash and SignatureData.M. Zero preserves
+	// the legacy big.Int.Bytes() behavior for backward compatibility.
+	fullBytesLen int
+	wi           *big.Int
 	ri        *big.Int
 	pointRi   *crypto.ECPoint
 	deCommit  cmts.HashDeCommitment
@@ -44,7 +52,13 @@ type Signing struct {
 // The receiver key may have been produced by a keygen that involved more parties than the
 // current signing committee; NewSigning transparently reindexes Ks and BigXj to match
 // params.Parties().IDs() via SubsetForParties, so callers can pass the full keygen key as-is.
-func (key *Key) NewSigning(ctx context.Context, msg *big.Int, params *tss.Parameters) (*Signing, error) {
+// An optional fullBytesLen specifies the intended byte length of msg (e.g. 32
+// for a SHA-256 hash). When provided, the message is left-padded to exactly
+// that many bytes for both the challenge hash and the emitted SignatureData.M,
+// so a hash with leading zero bytes verifies correctly under an external
+// Ed25519 verifier. When omitted (legacy behavior), msg.Bytes() is used, which
+// strips leading zeros.
+func (key *Key) NewSigning(ctx context.Context, msg *big.Int, params *tss.Parameters, fullBytesLen ...int) (*Signing, error) {
 	subsetKey, err := key.SubsetForParties(params.Parties().IDs())
 	if err != nil {
 		return nil, err
@@ -59,10 +73,26 @@ func (key *Key) NewSigning(ctx context.Context, msg *big.Int, params *tss.Parame
 		Done:   make(chan *SignatureData, 1),
 		Err:    make(chan error, 1),
 	}
+	if len(fullBytesLen) > 0 {
+		s.fullBytesLen = fullBytesLen[0]
+	}
 	if err := s.round1(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// msgBytes returns the message encoded for hashing and emission. When
+// fullBytesLen > 0 the value is left-padded to exactly that many bytes via
+// FillBytes; otherwise the legacy big.Int.Bytes() encoding (which strips
+// leading zeros) is used.
+func (s *Signing) msgBytes() []byte {
+	if s.fullBytesLen == 0 {
+		return s.msg.Bytes()
+	}
+	b := make([]byte, s.fullBytesLen)
+	s.msg.FillBytes(b)
+	return b
 }
 
 // getSSID returns ssid from local params, including BigXj in the hash (unlike keygen).
@@ -283,7 +313,7 @@ func (s *Signing) round3(otherIds []*tss.PartyID, r2msgs []*signRound2msg) {
 	h := sha512.New()
 	h.Write(encodedR[:])
 	h.Write(encodedPubKey[:])
-	h.Write(s.msg.Bytes())
+	h.Write(s.msgBytes())
 
 	var lambda [64]byte
 	h.Sum(lambda[:0])
@@ -338,7 +368,7 @@ func (s *Signing) finalize(r *big.Int, localS *[32]byte, encodedR *[32]byte, r3m
 		Signature: append(encodedR[:], sumS[:]...),
 		R:         r.Bytes(),
 		S:         sInt.Bytes(),
-		M:         s.msg.Bytes(),
+		M:         s.msgBytes(),
 	}
 
 	// verify signature
