@@ -213,25 +213,40 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 	kg.ui = nil
 
 	// register two receivers (round2-1 P2P shares, round2-2 broadcast decommit+proof)
-	// use atomic counter to track completion of both
+	// use atomic counter to track completion of both.
+	//
+	// The two receiver callbacks run on independent goroutines and each
+	// publishes a captured slice (r2msg1s / r2msg2s) before bumping the
+	// counter. The goroutine that observes counter == 2 then reads BOTH
+	// slices. atomic.AddInt32 orders the counter but not the slice writes,
+	// so a mutex provides the happens-before edge between each publishing
+	// write and the consuming read (data race under -race otherwise).
+	var mu sync.Mutex
 	var counter int32
 	var r2msg1s []*keygenRound2msg1
 	var r2msg2s []*keygenRound2msg2
 
 	check := func() {
 		if atomic.AddInt32(&counter, 1) == 2 {
-			kg.processRound3(otherIds, r2msg1s, r2msg2s)
+			mu.Lock()
+			m1, m2 := r2msg1s, r2msg2s
+			mu.Unlock()
+			kg.processRound3(otherIds, m1, m2)
 		}
 	}
 
 	rcv1 := tss.NewJsonExpect[keygenRound2msg1]("eddsa:keygen:round2-1", otherIds, func(ids []*tss.PartyID, msgs []*keygenRound2msg1) {
+		mu.Lock()
 		r2msg1s = msgs
+		mu.Unlock()
 		check()
 	})
 	kg.params.Broker().Connect("eddsa:keygen:round2-1", rcv1)
 
 	rcv2 := tss.NewJsonExpect[keygenRound2msg2]("eddsa:keygen:round2-2", otherIds, func(ids []*tss.PartyID, msgs []*keygenRound2msg2) {
+		mu.Lock()
 		r2msg2s = msgs
+		mu.Unlock()
 		check()
 	})
 	kg.params.Broker().Connect("eddsa:keygen:round2-2", rcv2)

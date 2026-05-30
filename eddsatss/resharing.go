@@ -210,6 +210,14 @@ func (rs *Resharing) round2New(oldIds []*tss.PartyID, r1msgs []*resharingRound1m
 // setupNewRound3Receiver registers receivers for round 3 P2P shares and broadcast decommitments.
 func (rs *Resharing) setupNewRound3Receiver(oldIds []*tss.PartyID, r1msgs []*resharingRound1msg) {
 	// We need both round3-1 (P2P shares) and round3-2 (broadcast decommitments) from all old parties.
+	//
+	// The two receiver callbacks run on independent goroutines and each
+	// publishes its captured slices before bumping the counter. The
+	// goroutine that observes counter == 2 then reads all four slices.
+	// atomic.AddInt32 orders the counter but not the slice writes, so a
+	// mutex provides the happens-before edge between each publishing write
+	// and the consuming read (data race under -race otherwise).
+	var mu sync.Mutex
 	var counter int32
 	var r3msg1s []*resharingRound3msg1
 	var r3msg1Ids []*tss.PartyID
@@ -218,7 +226,11 @@ func (rs *Resharing) setupNewRound3Receiver(oldIds []*tss.PartyID, r1msgs []*res
 
 	check := func() {
 		if atomic.AddInt32(&counter, 1) == 2 {
-			rs.round4New(oldIds, r1msgs, r3msg1Ids, r3msg1s, r3msg2Ids, r3msg2s)
+			mu.Lock()
+			m1, m1Ids := r3msg1s, r3msg1Ids
+			m2, m2Ids := r3msg2s, r3msg2Ids
+			mu.Unlock()
+			rs.round4New(oldIds, r1msgs, m1Ids, m1, m2Ids, m2)
 		}
 	}
 
@@ -227,8 +239,10 @@ func (rs *Resharing) setupNewRound3Receiver(oldIds []*tss.PartyID, r1msgs []*res
 	copy(allOldIds, rs.params.OldParties().IDs())
 
 	rcv1 := tss.NewJsonExpect[resharingRound3msg1]("eddsa:reshare:round3-1", allOldIds, func(ids []*tss.PartyID, msgs []*resharingRound3msg1) {
+		mu.Lock()
 		r3msg1s = msgs
 		r3msg1Ids = ids
+		mu.Unlock()
 		check()
 	})
 	rs.params.Broker().Connect("eddsa:reshare:round3-1", rcv1)
@@ -238,8 +252,10 @@ func (rs *Resharing) setupNewRound3Receiver(oldIds []*tss.PartyID, r1msgs []*res
 	copy(allOldIds2, rs.params.OldParties().IDs())
 
 	rcv2 := tss.NewJsonExpect[resharingRound3msg2]("eddsa:reshare:round3-2", allOldIds2, func(ids []*tss.PartyID, msgs []*resharingRound3msg2) {
+		mu.Lock()
 		r3msg2s = msgs
 		r3msg2Ids = ids
+		mu.Unlock()
 		check()
 	})
 	rs.params.Broker().Connect("eddsa:reshare:round3-2", rcv2)
