@@ -81,6 +81,13 @@ func signCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, rng io.
 			return nil, fmt.Errorf("dklstss: Sign key %d inconsistent with first key", idx)
 		}
 	}
+	// Canonicalize the subset to ascending PartyID order so the
+	// tweak-absorbing slot (signers[0]) matches the broker convention,
+	// which sorts the subset and absorbs the HD tweak at sorted position 0
+	// (see signing_party.go). Without this, an unsorted signerIdx would
+	// place the tweak on a different party between the sync and broker
+	// paths and yield signatures under mismatched child keys.
+	sortSignersByID(signers)
 
 	// Lagrange coefficients for subset evaluation at x=0.
 	ids := make([]*big.Int, sgn)

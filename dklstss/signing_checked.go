@@ -71,6 +71,9 @@ func signCheckedCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, 
 			return nil, fmt.Errorf("dklstss: SignChecked key %d inconsistent", idx)
 		}
 	}
+	// Canonicalize subset order — see signing.go for the rationale (tweak
+	// slot and Lagrange ordering must match the broker convention).
+	sortSignersByID(signers)
 
 	ids := make([]*big.Int, sgn)
 	for i, k := range signers {

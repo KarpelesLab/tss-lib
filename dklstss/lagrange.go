@@ -3,6 +3,7 @@ package dklstss
 import (
 	"fmt"
 	"math/big"
+	"sort"
 
 	"github.com/KarpelesLab/tss-lib/v2/common"
 	"github.com/KarpelesLab/tss-lib/v2/tss"
@@ -69,6 +70,19 @@ func validateSortedSubset(subset tss.SortedPartyIDs) error {
 		}
 	}
 	return nil
+}
+
+// sortSignersByID sorts the resolved signing-subset keys in place into
+// ascending PartyID.KeyInt() order. The synchronous signing/presigning
+// APIs accept signerIdx in arbitrary order; canonicalizing here makes
+// their tweak-absorbing slot (signers[0]) and Lagrange ordering match the
+// broker-driven path, which enforces a sorted subset via
+// validateSortedSubset. Each key's own PartyID is PartyIDs[Idx].
+func sortSignersByID(signers []*Key) {
+	sort.SliceStable(signers, func(a, b int) bool {
+		return signers[a].PartyIDs[signers[a].Idx].KeyInt().
+			Cmp(signers[b].PartyIDs[signers[b].Idx].KeyInt()) < 0
+	})
 }
 
 // hashToScalar converts an arbitrary-length message digest into the
