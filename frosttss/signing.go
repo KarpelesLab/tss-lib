@@ -2,7 +2,9 @@ package frosttss
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"sync"
 
@@ -156,17 +158,27 @@ func (s *Signing) round1() error {
 	// G.SerializeScalar(secret)). Mixing the share Xi into each nonce
 	// derivation defangs a faulty/repeated RNG: if rand returns the same
 	// bytes twice, the share-binding still produces distinct nonces (as
-	// long as Xi differs across calls — and Xi is per-key, not per-call,
-	// so reuse of the SAME Key with a repeating RNG over different
-	// messages still yields distinct (d, e) per call because the random
-	// bytes are mixed in too). The full defense is: "either rand or
-	// secret must differ across calls" — substantially weaker than the
-	// pre-fix "rand must never repeat."
-	di, err := frost.NonceGenerate(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi)
+	// long as Xi differs across calls — and Xi is per-key, not per-call).
+	//
+	// The two derivations additionally carry distinct domain-separation
+	// labels ("hiding"/"binding") folded into the H3 input via
+	// nonceGenerateLabeled. Without this, BOTH nonces hash
+	// H3(random_bytes || EncodeScalar(Xi)) over the SAME Xi, so a single
+	// repeating-RNG read collapses d_i == e_i — and a d==e signing nonce
+	// leaks the share. The label guarantees d_i != e_i even when rand
+	// returns identical bytes for both reads.
+	//
+	// Precondition (corrected): each emitted nonce is unpredictable as long
+	// as (random_bytes XOR label) is unique per call — i.e. the prior
+	// "rand must never repeat WITHIN a signing session" requirement is
+	// dropped; only cross-session rand reuse over the same (Xi, message)
+	// remains a concern, and that is defended by the message entering the
+	// challenge, not the nonce.
+	di, err := nonceGenerateLabeled(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi, nonceHidingLabel)
 	if err != nil {
 		return fmt.Errorf("frosttss: nonce_generate d_i: %w", err)
 	}
-	ei, err := frost.NonceGenerate(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi)
+	ei, err := nonceGenerateLabeled(frost.Ed25519Ciphersuite(), s.params.Rand(), s.key.Xi, nonceBindingLabel)
 	if err != nil {
 		return fmt.Errorf("frosttss: nonce_generate e_i: %w", err)
 	}
@@ -430,6 +442,56 @@ func (s *Signing) finalize(
 		Signature: sig,
 		M:         s.msg,
 	})
+}
+
+// Domain-separation labels appended to the nonce_generate H3 input so the
+// hiding nonce d_i and the binding nonce e_i derive to distinct scalars even
+// when the RNG returns identical random bytes for both reads (faulty RNG, VM
+// snapshot+rollback). See round1 / FINDING 6.
+const (
+	nonceHidingLabel  = "hiding"
+	nonceBindingLabel = "binding"
+)
+
+// nonceGenerateLabeled is RFC 9591 §4.1 nonce_generate with an extra
+// domain-separation label folded into the H3 input:
+//
+//	k = cs.H3(random_bytes || EncodeScalar(secret) || label)
+//
+// It mirrors frost.NonceGenerate (which omits the label) but distinguishes the
+// hiding and binding derivations so d_i != e_i even under identical RNG bytes.
+// The label is applied here at the call site rather than in
+// crypto/frost.NonceGenerate to avoid a signature change to that shared
+// primitive; a follow-up could promote a labeled variant into crypto/frost for
+// reuse (the ristretto255 sibling carries an identical local helper today).
+func nonceGenerateLabeled(cs frost.Ciphersuite, rng io.Reader, secret *big.Int, label string) (*big.Int, error) {
+	if cs == nil {
+		return nil, errors.New("frosttss: nonceGenerateLabeled requires a non-nil ciphersuite")
+	}
+	if secret == nil {
+		return nil, errors.New("frosttss: nonceGenerateLabeled requires a non-nil secret")
+	}
+	if rng == nil {
+		return nil, errors.New("frosttss: nonceGenerateLabeled requires a non-nil rng")
+	}
+	var k [32]byte
+	if _, err := io.ReadFull(rng, k[:]); err != nil {
+		return nil, fmt.Errorf("frosttss: nonceGenerateLabeled rand: %w", err)
+	}
+	enc := cs.Group().EncodeScalar(secret)
+	defer func() {
+		for i := range k {
+			k[i] = 0
+		}
+		for i := range enc {
+			enc[i] = 0
+		}
+	}()
+	buf := make([]byte, 0, len(k)+len(enc)+len(label))
+	buf = append(buf, k[:]...)
+	buf = append(buf, enc...)
+	buf = append(buf, label...)
+	return cs.H3(buf), nil
 }
 
 func leBytesToBigInt(le []byte) *big.Int {

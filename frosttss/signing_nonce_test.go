@@ -69,6 +69,29 @@ func TestNonceGenerateNilArgsErrors(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNonceGenerateLabeledSeparatesHidingBinding confirms FINDING 6: with the
+// SAME secret and the SAME random bytes, the hiding and binding labels still
+// produce distinct nonces. Without the label both would hash
+// H3(random || EncodeScalar(Xi)) and collapse to d_i == e_i.
+func TestNonceGenerateLabeledSeparatesHidingBinding(t *testing.T) {
+	fixed := make([]byte, 64)
+	_, err := rand.Read(fixed)
+	require.NoError(t, err)
+	rng1 := bytes.NewReader(fixed)
+	rng2 := bytes.NewReader(fixed)
+
+	cs := frost.Ed25519Ciphersuite()
+	secret := big.NewInt(123456789)
+
+	d, err := nonceGenerateLabeled(cs, rng1, secret, nonceHidingLabel)
+	require.NoError(t, err)
+	e, err := nonceGenerateLabeled(cs, rng2, secret, nonceBindingLabel)
+	require.NoError(t, err)
+
+	require.NotEqual(t, d.String(), e.String(),
+		"hiding and binding nonces must differ even from identical rand+secret")
+}
+
 // repeatingReader returns the same buffer over and over — simulates a
 // catastrophically-faulty RNG.
 type repeatingReader struct {
