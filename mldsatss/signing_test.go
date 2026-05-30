@@ -26,6 +26,10 @@ type hubBroker struct {
 
 type testHub struct {
 	brokers []*hubBroker
+	// mutate, when set, is invoked on every message a broker forwards to its
+	// peers (i.e. on each outgoing broadcast). It may rewrite msg.Data in place
+	// to model a malicious party. It receives the sender's broker index.
+	mutate func(fromIdx int, msg *tss.JsonMessage)
 }
 
 func newTestHub(n int) *testHub {
@@ -58,6 +62,9 @@ func (b *hubBroker) Connect(typ string, dest tss.MessageReceiver) {
 
 func (b *hubBroker) Receive(msg *tss.JsonMessage) error {
 	if msg.From.Index == b.partyIdx {
+		if b.hub.mutate != nil {
+			b.hub.mutate(b.partyIdx, msg)
+		}
 		if msg.To != nil {
 			return b.hub.brokers[msg.To.Index].Receive(msg)
 		}
@@ -251,4 +258,85 @@ func TestSigning44_BadContextMismatch(t *testing.T) {
 	require.True(t, pk.Verify(sig, msg, []byte("ctx-A")))
 	require.False(t, pk.Verify(sig, msg, []byte("ctx-B")))
 	require.False(t, pk.Verify(sig, []byte("other msg"), []byte("ctx-A")))
+}
+
+// TestSigning44_InvalidResponseIsAttributed exercises FIX 2: when one party
+// broadcasts a garbage round-3 response (a z_i block with grossly out-of-bound
+// coefficients), the combiner at every honest party must IDENTIFY that party
+// (returning *ErrPartyResponseInvalid naming its committee slot) rather than
+// silently summing the garbage and surfacing an unattributable
+// ErrAllTriesRejected.
+func TestSigning44_InvalidResponseIsAttributed(t *testing.T) {
+	var seed [32]byte
+	seed[0] = 0x99
+	tParams, err := GetThresholdParams44(2, 2)
+	require.NoError(t, err)
+	pk, keys, err := TrustedDealerKeygen44(seed, tParams)
+	require.NoError(t, err)
+	_ = pk
+
+	signers, _, keyIds := buildCommittee(2, 2)
+	msg := []byte("identifiable-abort test")
+	ctx := []byte("ctx")
+
+	// The malicious party is committee slot 1 (broker index 1). Its round-3
+	// Resp is overwritten in-flight with an all-max-coefficient block, whose
+	// ν-scaled L2 norm vastly exceeds Rp² — the strongest case the partial
+	// per-party check catches.
+	const maliciousIdx = 1
+	respLen := int(tParams.K) * mldsa.L44 * mldsa.EncodingSize18
+
+	hub := newTestHub(len(signers))
+	hub.mutate = func(fromIdx int, m *tss.JsonMessage) {
+		if fromIdx != maliciousIdx {
+			return
+		}
+		if m.Type != (&Parameters{attemptID: 0}).msgType(MsgTypeR3_44) {
+			return
+		}
+		// Build a fully-saturated garbage response: every coefficient = γ1,
+		// which packs/unpacks cleanly through Z17 but blows the L2 bound.
+		var maxPoly mldsa.RingElement
+		for c := 0; c < mldsa.N; c++ {
+			maxPoly[c] = mldsa.FieldElement(mldsa.Gamma1Pow17)
+		}
+		garbage := make([]byte, 0, respLen)
+		for tryIdx := 0; tryIdx < int(tParams.K); tryIdx++ {
+			for j := 0; j < mldsa.L44; j++ {
+				garbage = append(garbage, mldsa.PackZ17(maxPoly)...)
+			}
+		}
+		m.Data = &signRound3msg44{Resp: garbage}
+	}
+
+	p2pCtx := tss.NewPeerContext(signers)
+	sigs := make([]*Signing44, len(signers))
+	for i, pid := range signers {
+		params, perr := NewParameters(pid, p2pCtx, tParams, keyIds, hub.brokers[i])
+		require.NoError(t, perr)
+		params.SetAttemptID(0)
+		key := keys[keyIds[i]]
+		s, serr := NewSigning44(context.Background(), params, key, msg, ctx)
+		require.NoError(t, serr)
+		sigs[i] = s
+	}
+
+	// The honest party (slot 0) receives the malicious slot-1 response and must
+	// attribute the abort to slot 1. (The malicious party itself sees its own
+	// genuine response, so we only assert on the honest victim.)
+	deadline := time.After(30 * time.Second)
+	select {
+	case <-sigs[0].Done:
+		t.Fatalf("honest party unexpectedly produced a signature from garbage input")
+	case err := <-sigs[0].Err:
+		var pe *ErrPartyResponseInvalid
+		require.ErrorAs(t, err, &pe,
+			"combiner must return *ErrPartyResponseInvalid, got %v", err)
+		require.Equal(t, maliciousIdx, pe.Slot, "must name the offending committee slot")
+		require.Equal(t, keyIds[maliciousIdx], pe.KeyId, "must name the offending keyId")
+		require.NotErrorIs(t, err, ErrAllTriesRejected,
+			"must not be an unattributable ErrAllTriesRejected")
+	case <-deadline:
+		t.Fatal("honest party timed out")
+	}
 }

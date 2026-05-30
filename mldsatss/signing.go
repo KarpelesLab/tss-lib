@@ -45,6 +45,29 @@ func zeroizeNttVecK44(v *[mldsa.K44]mldsa.NttElement) {
 // Combine-side correctness). Callers should retry with a fresh attempt.
 var ErrAllTriesRejected = errors.New("mldsatss: all tries rejected; retry")
 
+// ErrPartyResponseInvalid is returned by combine when a specific party's
+// round-3 response block fails the per-party validity check. Unlike
+// ErrAllTriesRejected (a non-attributable retry signal), this error names the
+// offending committee slot so the abort is identifiable. The caller should
+// drop/penalize that party rather than blindly retry.
+//
+// NOTE: the check this error reports is a *partial* identifiable-abort check
+// (a structural L2 bound on each z_i, mirroring the L-part of the party's own
+// rejection gate). A full algebraic check — verifying A·z_i − c·t_i matches
+// the committed w_i — requires each party's public key share t_i = A·s1_i +
+// s2_i, which this protocol never transmits or stores. See validatePartyResponses.
+type ErrPartyResponseInvalid struct {
+	Slot  int    // committee slot of the offending party
+	KeyId uint8  // Key44.Id of the offending party
+	Try   int    // which of the K tries failed
+	Cause string // human-readable reason
+}
+
+func (e *ErrPartyResponseInvalid) Error() string {
+	return fmt.Sprintf("mldsatss: invalid round-3 response from committee slot %d (keyId %d), try %d: %s",
+		e.Slot, e.KeyId, e.Try, e.Cause)
+}
+
 // Parameters bundles the session configuration for a threshold ML-DSA-44
 // signing run.
 type Parameters struct {
@@ -565,6 +588,17 @@ func (s *Signing44) combine() {
 	}
 	params := s.params.thParams
 
+	// Per-party response validity (FIX 2 — identifiable abort). Before summing
+	// every party's z_i unconditionally, range/bound-check each party's block.
+	// A malicious party that submits garbage z_i (large coefficients) would
+	// otherwise corrupt the aggregate and force ErrAllTriesRejected for the
+	// whole committee with no attribution (a silent DoS). On failure we name
+	// the offending committee slot instead of silently summing.
+	if err := s.validatePartyResponses(); err != nil {
+		s.fail(err)
+		return
+	}
+
 	// Aggregate zfinal[try][j] = Σ_{slot} z_try_from_party[j]
 	zfinal := make([][mldsa.L44]mldsa.RingElement, params.K)
 	for slot := 0; slot < int(params.T); slot++ {
@@ -702,6 +736,71 @@ func (s *Signing44) combine() {
 	}
 
 	s.fail(ErrAllTriesRejected)
+}
+
+// validatePartyResponses checks every party's round-3 response block for
+// per-party validity *before* combine sums them, so a single malformed/
+// malicious z_i is attributed to its sender instead of silently corrupting
+// the aggregate (FIX 2 — identifiable abort).
+//
+// Derivable check (strongest available from public values at combine time):
+// an honest party either rejects a try (sends an all-zero z_i block, which
+// passes trivially) or accepts it, in which case its z_i is the L-part of a
+// hyperball-masked response zf that passed the party's own gate
+// !zf.Excess(R, ν), i.e. Σ_L (zf_L[j]/ν)² + Σ_K (zf_K[j])² ≤ R². The L-part
+// alone therefore satisfies Σ_L (z_i[j]/ν)² ≤ R²; integer rounding adds at
+// most √(L·N)·0.5/ν ≈ 5.3 to the ν-scaled L2 norm, comfortably inside the
+// secondary radius Rp (Rp − R ≥ 55 across the whole parameter table). So we
+// reject any non-zero z_i block whose ν-scaled L2 norm exceeds Rp — an honest
+// accepted block never does, while gross garbage (the DoS vector) is caught
+// and its sender named.
+//
+// LIMITATION (partial identifiable abort): this is a structural bound, not a
+// full algebraic check. A full check would verify HighBits(A·z_i − c·t_i) ==
+// HighBits(w_i) against the party's committed w_i, but that needs each party's
+// public key share t_i = A·s1_i + s2_i, which this trusted-dealer protocol
+// never transmits or stores (only the aggregate t1 is public). A party can
+// thus still submit a small but algebraically-wrong z_i that passes this bound
+// yet breaks the aggregate; such a case still surfaces as ErrAllTriesRejected
+// (non-attributable). Catching it would require publishing per-party t_i (or a
+// per-party commitment/proof binding z_i to w_i), which is out of scope here.
+func (s *Signing44) validatePartyResponses() error {
+	params := s.params.thParams
+	nu := params.Nu
+	rpSq := params.Rp * params.Rp
+
+	for slot := 0; slot < int(params.T); slot++ {
+		resp := s.r3resps[slot]
+		off := 0
+		for tryIdx := 0; tryIdx < int(params.K); tryIdx++ {
+			var l2 float64 // Σ_L (z_i[j]/ν)² for this try's block
+			nonZero := false
+			for j := 0; j < mldsa.L44; j++ {
+				poly := mldsa.UnpackZ17(resp[off : off+mldsa.EncodingSize18])
+				off += mldsa.EncodingSize18
+				for c := 0; c < mldsa.N; c++ {
+					// Recenter to a signed magnitude in [0, Q/2].
+					mag := float64(mldsa.InfinityNorm(poly[c]))
+					if mag != 0 {
+						nonZero = true
+					}
+					scaled := mag / nu
+					l2 += scaled * scaled
+				}
+			}
+			// An all-zero block is a legitimate "try rejected at party"; only
+			// bound-check blocks that actually carry a response.
+			if nonZero && l2 > rpSq {
+				return &ErrPartyResponseInvalid{
+					Slot:  slot,
+					KeyId: s.params.keyIds[slot],
+					Try:   tryIdx,
+					Cause: fmt.Sprintf("z_i ν-scaled L2 norm² %.0f exceeds Rp² %.0f", l2, rpSq),
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // --- helpers ---------------------------------------------------------------
