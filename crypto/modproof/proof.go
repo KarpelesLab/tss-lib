@@ -131,6 +131,13 @@ func (pf *ProofMod) Verify(Session []byte, N *big.Int) bool {
 	if pf.W.Sign() != 1 || pf.W.Cmp(N) != -1 {
 		return false
 	}
+	// W must be a unit mod N (gcd(W, N) == 1). Without this check, a W sharing
+	// a factor with N has Jacobi(W, N) == 0 and passes the "not a quadratic
+	// residue" test above, breaking the soundness assumption that W is a unit /
+	// quadratic non-residue.
+	if new(big.Int).GCD(nil, nil, pf.W, N).Cmp(one) != 0 {
+		return false
+	}
 	for i := range pf.Z {
 		if pf.Z[i].Sign() != 1 || pf.Z[i].Cmp(N) != -1 {
 			return false
