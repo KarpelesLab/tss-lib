@@ -394,6 +394,15 @@ func (s *Signing44) onR2(from []*tss.PartyID, msgs []*signRound2msg44) {
 			s.fail(fmt.Errorf("mldsatss: round2 wbuf size %d != expected %d", len(msgs[i].Wbuf), expectedBufLen))
 			return
 		}
+		// Range-check every packed coefficient. mldsa.UnpackPolyQ yields 23-bit
+		// values in [0, 2^23); coefficients in [Q, 2^23) are non-canonical and
+		// would feed HighBits/Decompose (which assume inputs < Q). A peer fully
+		// controls its self-committed wbuf, so reject any non-canonical buffer
+		// here, before aggregation.
+		if err := validateCanonicalWbuf(msgs[i].Wbuf); err != nil {
+			s.fail(fmt.Errorf("mldsatss: round2 wbuf from committee slot %d: %w", slot, err))
+			return
+		}
 		// Verify against the Round 1 commitment.
 		have := s.computeCommitment(s.params.keyIds[slot], msgs[i].Wbuf)
 		if !bytesEqual(have, s.r1commits[slot]) {
@@ -671,6 +680,25 @@ func (s *Signing44) combine() {
 }
 
 // --- helpers ---------------------------------------------------------------
+
+// validateCanonicalWbuf unpacks a peer-supplied packed-w buffer one polynomial
+// at a time and verifies every coefficient is canonical (< Q). It returns an
+// error on the first out-of-range coefficient. The caller must already have
+// validated the buffer length. Honest parties pack only reduced coefficients
+// (w_i = A·r_i + e_i mod q), so this never rejects a canonical buffer.
+func validateCanonicalWbuf(wbuf []byte) error {
+	off := 0
+	for off+mldsa.PackPolyQSize <= len(wbuf) {
+		poly := mldsa.UnpackPolyQ(wbuf[off : off+mldsa.PackPolyQSize])
+		for j := 0; j < mldsa.N; j++ {
+			if uint32(poly[j]) >= mldsa.Q {
+				return fmt.Errorf("non-canonical coefficient %d >= Q at poly offset %d", uint32(poly[j]), off)
+			}
+		}
+		off += mldsa.PackPolyQSize
+	}
+	return nil
+}
 
 // highBitsVecK44 returns w₁ (HighBits) of a VecK as a RingElement-valued
 // array (each coefficient in [0, 44) for ML-DSA-44's γ₂=(q−1)/88).
