@@ -12,6 +12,14 @@
 // generation protocol is not yet defined for this scheme and is left as
 // future work.
 //
-// WARNING: This is an academic-grade prototype. It has not received
-// independent cryptanalytic review and is not suitable for production use.
+// WARNING: This is an academic-grade prototype. It has NOT received
+// independent cryptanalytic review and is NOT suitable for production use.
+//
+// In particular, the scheme's security rests on the (as-yet unproven in this
+// setting) masking argument of ePrint 2025/1166: each party makes a local
+// rejection decision and reveals its per-try w_i and z_i, which in principle
+// leak information about the secret's norm. Whether the hyperball masking
+// fully hides that leakage is a construction- and parameter-level question
+// for expert human review. Do not deploy this package, or vary its (t, n)
+// parameters, without such review.
 package mldsatss
