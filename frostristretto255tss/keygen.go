@@ -123,6 +123,16 @@ func (kg *Keygen) round2(otherIds []*tss.PartyID, r1msgs []*keygenRound1msg) {
 			}
 			vsj[k] = el
 		}
+		// Identity-element rejection: a dealer that publishes phi_{j,0} =
+		// identity contributes zero to the joint secret. The Schnorr PoK on
+		// the constant coefficient passes with witness 0, so without this
+		// explicit check a colluding dealer could effectively skip its
+		// contribution to the joint key. Reject every dealer whose phi_{j,0}
+		// resolves to the identity. Mirrors frosttss/keygen.go round2.
+		if vsj[0].IsIdentity() {
+			sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("party %s round-1 phi_{j,0} is the group identity (rogue-zero contribution)", pid))
+			return
+		}
 		peerVs[n] = vsj
 
 		Rj, err := g.DecodeElement(r1.SchnorrR)
@@ -238,6 +248,15 @@ func (kg *Keygen) finalize(
 			BigXj = next
 		}
 		kg.data.BigXj[j] = BigXj
+	}
+	// Identity-element rejection on the joint public key. If every dealer
+	// colluded to drive phi_{*,0} to identity (and the per-dealer identity
+	// check above were ever loosened), the joint pub would be identity and
+	// any "signature" would trivially verify. Reject at finalize as defense
+	// in depth. Mirrors frosttss/keygen.go finalize.
+	if Vc[0].IsIdentity() {
+		sendOnce(&kg.errOnce, kg.Err, fmt.Errorf("frostristretto255tss: joint public key is the group identity"))
+		return
 	}
 	kg.data.GroupPublicKey = Vc[0]
 	kg.a_i_0 = nil
