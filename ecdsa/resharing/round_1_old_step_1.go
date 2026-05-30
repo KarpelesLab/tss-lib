@@ -109,12 +109,11 @@ func (round *round1) Update() (bool, error) {
 		}
 		round.oldOK[j] = true
 
-		// save the ecdsa pub received from the old committee
-		if round.temp.dgRound1Messages[0] == nil {
-			ret = false
-			continue
-		}
-		r1msg := round.temp.dgRound1Messages[0].Content().(*DGRound1Message)
+		// save the ecdsa pub received from the old committee.
+		// Read the ECDSAPub from the message of the party j currently being
+		// processed (NOT a hard-coded index 0), so a disagreeing ECDSAPub from
+		// any old party is detected and attributed to that party.
+		r1msg := round.temp.dgRound1Messages[j].Content().(*DGRound1Message)
 		candidate, err := r1msg.UnmarshalECDSAPub(round.Params().EC())
 		if err != nil {
 			return false, round.WrapError(errors.New("unable to unmarshal the ecdsa pub key"), msg.GetFrom())
