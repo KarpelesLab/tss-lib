@@ -509,6 +509,19 @@ func (rs *Resharing) round4New() {
 		H1j := new(big.Int).SetBytes(msg.H1)
 		H2j := new(big.Int).SetBytes(msg.H2)
 
+		// Enforce a minimum bit length on the peer Paillier modulus N and NTilde
+		// before storing/using them (parity with keygen). A short modulus weakens
+		// the range/Mod proofs and the Paillier encryption itself.
+		paillierN := new(big.Int).SetBytes(msg.PaillierN)
+		if paillierN.BitLen() < paillierModulusLen {
+			rs.Err <- fmt.Errorf("party %s: paillier modulus bit length %d < %d", rs.r2msg1From[k], paillierN.BitLen(), paillierModulusLen)
+			return
+		}
+		if NTildej.BitLen() < paillierModulusLen {
+			rs.Err <- fmt.Errorf("party %s: NTilde bit length %d < %d", rs.r2msg1From[k], NTildej.BitLen(), paillierModulusLen)
+			return
+		}
+
 		if H1j.Cmp(H2j) == 0 {
 			rs.Err <- fmt.Errorf("party %s: H1j == H2j", rs.r2msg1From[k])
 			return
