@@ -209,6 +209,11 @@ func signCheckedCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, 
 		s.Sub(q, s)
 		v ^= 1
 	}
+	// Final self-verification gate (see signing.go): reject any assembled
+	// signature that does not verify under the (possibly tweaked) pubkey.
+	if err := verifyFinalSignature(pub, tweak, hash, r, s); err != nil {
+		return nil, err
+	}
 	return &Signature{R: r, S: s, V: v}, nil
 }
 

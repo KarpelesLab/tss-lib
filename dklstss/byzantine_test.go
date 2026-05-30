@@ -1,7 +1,6 @@
 package dklstss
 
 import (
-	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"math/big"
@@ -18,12 +17,12 @@ import (
 // TestByzantineMutatedShareAfterKeygen models the simplest attack on
 // signing: an attacker corrupts a single party's Shamir share between
 // DKG and signing (e.g. tampering with storage). The signing protocol
-// will produce a syntactically-valid but incorrect signature; the
-// canonical detection is signature verification at the consumer.
+// produces a syntactically-valid but incorrect (R, S); the final
+// self-verification gate (verify_gate.go) detects this at SIGN time and
+// returns an error instead of handing back a non-verifying signature.
 func TestByzantineMutatedShareAfterKeygen(t *testing.T) {
 	keys, err := Keygen(3, 1, genPartyIDs(3), rand.Reader)
 	require.NoError(t, err)
-	pub := keys[0].ECDSAPub
 
 	// Tamper with party 0's share.
 	tampered := *keys[0]
@@ -32,13 +31,11 @@ func TestByzantineMutatedShareAfterKeygen(t *testing.T) {
 
 	msg := sha256.Sum256([]byte("byzantine: tampered share"))
 	sig, err := Sign(tamperedKeys, []int{0, 1}, msg[:], rand.Reader)
-	require.NoError(t, err, "Sign completes; detection is at verify time")
-
-	pubECDSA := &ecdsa.PublicKey{Curve: pub.Curve(), X: pub.X(), Y: pub.Y()}
-	// Tampering must result in verification failure (with overwhelming
-	// probability).
-	require.False(t, ecdsa.Verify(pubECDSA, msg[:], sig.R, sig.S),
-		"tampered share must produce a non-verifying signature")
+	// The self-verification gate must reject the corrupt signature rather
+	// than return it as success (the previous, weaker contract deferred
+	// detection to the consumer's verify call).
+	require.Error(t, err, "tampered share must be caught by the sign-time verify gate")
+	require.Nil(t, sig, "no signature should be returned on gate failure")
 }
 
 // TestByzantineMutatedOTSenderState models a party whose OT extension

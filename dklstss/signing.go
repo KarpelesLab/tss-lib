@@ -266,6 +266,14 @@ func signCore(keys []*Key, signerIdx []int, tweak *big.Int, hash []byte, rng io.
 		v ^= 1
 	}
 
+	// Final self-verification gate: confirm (r, s) verifies under the
+	// (possibly tweaked) public key before returning. Catches a corrupt
+	// share or malicious peer reveal that would otherwise yield a
+	// non-verifying "signature" reported as success.
+	if err := verifyFinalSignature(pub, tweak, hash, r, s); err != nil {
+		return nil, err
+	}
+
 	return &Signature{R: r, S: s, V: v}, nil
 }
 

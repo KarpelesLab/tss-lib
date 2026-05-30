@@ -571,7 +571,15 @@ func (sp *SigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4) {
 		s.Sub(q, s)
 		v ^= 1
 	}
-	sendOnce(&sp.doneOnce, sp.Done, &Signature{R: new(big.Int).Set(sp.r), S: s, V: v})
+	rOut := new(big.Int).Set(sp.r)
+	// Final self-verification gate (see signing.go): a malicious round-4
+	// (φ_i, ŝ_i) reveal or corrupt share can otherwise drive this party to
+	// emit a non-verifying signature on Done. Reject it instead.
+	if err := verifyFinalSignature(sp.key.ECDSAPub, sp.tweak, sp.hash, rOut, s); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
+	sendOnce(&sp.doneOnce, sp.Done, &Signature{R: rOut, S: s, V: v})
 }
 
 // --- helpers --------------------------------------------------------

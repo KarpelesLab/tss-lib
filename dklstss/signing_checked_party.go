@@ -545,6 +545,12 @@ func (sp *CheckedSigningParty) finalize(otherIds []*tss.PartyID, msgs []*signR4)
 		v ^= 1
 	}
 
+	// Final self-verification gate (see signing.go): reject a non-verifying
+	// signature driven by a corrupt share or malicious round-4 reveal.
+	if err := verifyFinalSignature(sp.key.ECDSAPub, sp.tweak, sp.hash, sp.r, s); err != nil {
+		sendOnce(&sp.errOnce, sp.Err, err)
+		return
+	}
 	sig := &Signature{R: sp.r, S: s, V: v}
 	sendOnce(&sp.doneOnce, sp.Done, sig)
 }

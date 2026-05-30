@@ -375,7 +375,16 @@ func SignWithPresign(presign *PresignOutput, hash []byte, tweak *big.Int) (*Sign
 		s.Sub(q, s)
 		v ^= 1
 	}
-	return &Signature{R: new(big.Int).Set(presign.r), S: s, V: v}, nil
+	rOut := new(big.Int).Set(presign.r)
+	// Final self-verification gate (see signing.go): reject any assembled
+	// signature that does not verify under the (possibly tweaked) pubkey.
+	// Note the presign output was already consumed (CAS flipped) above; a
+	// failure here still burns the presign, which is correct — the nonce
+	// must never be reused even on a failed finalize.
+	if err := verifyFinalSignature(presign.Pub, tweak, hash, rOut, s); err != nil {
+		return nil, err
+	}
+	return &Signature{R: rOut, S: s, V: v}, nil
 }
 
 // SignWithPresignDurable is SignWithPresign with cross-restart single-use
