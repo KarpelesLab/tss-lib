@@ -236,6 +236,11 @@ func (s *Signing44) round1() error {
 	}
 	defer common.ZeroizeBytes(rhop[:])
 
+	// Compute μ now (it is also needed in round2/round3). Folding μ into the
+	// round-1 commitment binds the committed w to this specific message and
+	// context (FIX 1); computing it here makes it available before we commit.
+	s.computeMu()
+
 	// Cached matrix A (NTT form, row-major K44×L44).
 	A := s.key.Matrix()
 
@@ -278,7 +283,7 @@ func (s *Signing44) round1() error {
 		}
 	}
 
-	// Commitment: SHAKE256(Tr || keyId || wbuf) → 32 bytes.
+	// Commitment binds w to (act, attemptID, μ, keyId) — see computeCommitment.
 	commit := s.computeCommitment(s.key.Id, s.wbuf)
 	s.r1commits[s.myRank] = commit
 
@@ -302,11 +307,38 @@ func (s *Signing44) round1() error {
 	return nil
 }
 
-// computeCommitment is the hash commitment to a party's packed w: 32 bytes
-// SHAKE256(Tr || keyId || wbuf).
-func (s *Signing44) computeCommitment(keyId uint8, wbuf []byte) []byte {
+// computeMu computes μ = SHAKE256(Tr || 0x00 || len(ctx) || ctx || msg) and
+// caches it in s.mu. It is idempotent and called once in round1 (so μ is
+// available for the round-1 commitment) and reused in round2/round3.
+func (s *Signing44) computeMu() {
 	h := sha3.NewSHAKE256()
 	h.Write(s.key.Tr[:])
+	h.Write([]byte{0, byte(len(s.msgCtx))})
+	h.Write(s.msgCtx)
+	h.Write(s.msg)
+	h.Read(s.mu[:])
+}
+
+// computeCommitment is the hash commitment to a party's packed w: 32 bytes
+//
+//	SHAKE256(Tr || act || attemptID || μ || keyId || wbuf).
+//
+// Binding act, the attemptID, and the message digest μ pins the committed w
+// to a specific (committee, attempt, message+context) so a w committed under
+// one (message, attempt, committee) cannot be replayed under another (FIX 1).
+// μ must already be populated (s.computeMu) before this is called.
+func (s *Signing44) computeCommitment(keyId uint8, wbuf []byte) []byte {
+	var attempt [4]byte
+	attempt[0] = byte(s.params.attemptID >> 24)
+	attempt[1] = byte(s.params.attemptID >> 16)
+	attempt[2] = byte(s.params.attemptID >> 8)
+	attempt[3] = byte(s.params.attemptID)
+
+	h := sha3.NewSHAKE256()
+	h.Write(s.key.Tr[:])
+	h.Write([]byte{s.act})
+	h.Write(attempt[:])
+	h.Write(s.mu[:])
 	h.Write([]byte{keyId})
 	h.Write(wbuf)
 	out := make([]byte, 32)
@@ -346,19 +378,12 @@ func (s *Signing44) onR1(from []*tss.PartyID, msgs []*signRound1msg44) {
 	}
 }
 
-// round2 broadcasts this party's packed w's and computes μ.
+// round2 broadcasts this party's packed w's. μ was already computed in round1
+// (and folded into the round-1 commitment); it is reused here unchanged.
 func (s *Signing44) round2() {
 	if s.bail() {
 		return
 	}
-	// μ = SHAKE256(Tr || 0x00 || len(ctx) || ctx || msg)
-	h := sha3.NewSHAKE256()
-	h.Write(s.key.Tr[:])
-	h.Write([]byte{0, byte(len(s.msgCtx))})
-	h.Write(s.msgCtx)
-	h.Write(s.msg)
-	h.Read(s.mu[:])
-
 	s.r2wbufs[s.myRank] = s.wbuf
 
 	msg := &signRound2msg44{Wbuf: s.wbuf}
