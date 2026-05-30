@@ -54,10 +54,10 @@ func (round *round3) Start() error {
 		}
 
 		Rj, err := crypto.NewECPoint(round.Params().EC(), coordinates[0], coordinates[1])
-		Rj = Rj.EightInvEight()
 		if err != nil {
 			return round.WrapError(fmt.Errorf("NewECPoint(Rj): %w", err), Pj)
 		}
+		Rj = Rj.EightInvEight()
 		proof, err := r2msg.UnmarshalZKProof(round.Params().EC())
 		if err != nil {
 			return round.WrapError(errors.New("failed to unmarshal Rj proof"), Pj)
